@@ -71,7 +71,7 @@ SwarmVision consists of four primary components:
 
 ```bash
 # Environment variables
-SWARMAGENT_ENS=mynode.swarmagent.eth
+SWARMAGENT_ENS=mynode.swarmcompute.eth
 SWARMAGENT_PRIVATE_KEY=0x...
 SWARMVISION_URL=http://swarmvision.io:8000
 
@@ -94,6 +94,16 @@ SWARMVISION_URL=http://swarmvision.io:8000
 | Identity | `identity/ens.py` | ENS resolution and verification |
 | Router | `routing/router.py` | Job assignment and load balancing |
 | Treasury | `treasury/pool.py` | Credit accounting and payments |
+
+### Identity Namespaces
+
+> **Note:** Identity namespaces are distinct by role.
+
+| Namespace | Role | Description |
+|-----------|------|-------------|
+| `*.swarmcompute.eth` | OPERATOR | Runs SwarmAgent, executes jobs, earns credits |
+| `*.swarmvision.eth` | CLIENT | Submits jobs, consumes compute, spends credits |
+| `*.eth` (generic) | CLIENT | Default role for other ENS names |
 
 ### API Endpoints
 
@@ -262,7 +272,7 @@ python -m swarmvision.os.core
 
 # SwarmAgent
 curl -fsSL https://swarmvision.io/install.sh | bash
-swarmagent register --ens mynode.swarmagent.eth
+swarmagent register --ens mynode.swarmcompute.eth
 swarmagent start
 ```
 

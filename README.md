@@ -53,8 +53,8 @@ swarmvision/
 # Install SwarmAgent
 curl -fsSL https://swarmvision.io/install.sh | bash
 
-# Register with ENS identity
-swarmagent register --ens yourname.eth
+# Register with ENS identity (operators use swarmcompute.eth)
+swarmagent register --ens yourname.swarmcompute.eth
 
 # Start earning
 swarmagent start

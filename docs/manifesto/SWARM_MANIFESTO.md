@@ -36,6 +36,12 @@ Identity is cryptographic. You are your keys.
 - Wallet signatures for authentication
 - No accounts to create, no passwords to forget
 
+**Identity namespaces are distinct by role:**
+- `*.swarmcompute.eth` — Operators who run SwarmAgent and execute jobs
+- `*.swarmvision.eth` — Clients who submit jobs and consume compute
+
+This separation ensures clear accountability and enables role-specific permissions.
+
 ### 2. No Data Storage
 
 Execution is ephemeral. We process, we prove, we forget.
@@ -102,7 +108,7 @@ You can run a SwarmAgent and earn.
 
 ```bash
 curl -fsSL https://swarmvision.io/install.sh | bash
-swarmagent register --ens yourname.swarmagent.eth
+swarmagent register --ens yourname.swarmcompute.eth
 swarmagent start
 ```
 

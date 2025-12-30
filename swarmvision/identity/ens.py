@@ -5,8 +5,8 @@ Identity in SwarmVision is based on ENS (Ethereum Name Service).
 No emails, no passwords — just cryptographic signatures.
 
 Naming conventions:
-- *.swarmagent.eth  → Compute operators (agents)
-- *.swarmvision.eth → Clients (job submitters)
+- *.swarmcompute.eth → Compute operators (agents running SwarmAgent)
+- *.swarmvision.eth  → Clients (job submitters)
 
 This module provides:
 - ENS resolution (mocked for now, pluggable for real ENS)
@@ -65,8 +65,8 @@ class ENSResolver:
         self._registry: dict[str, str] = {}
 
         # Pre-register some test identities
-        self._register_mock("operator1.swarmagent.eth", "0x1111111111111111111111111111111111111111")
-        self._register_mock("operator2.swarmagent.eth", "0x2222222222222222222222222222222222222222")
+        self._register_mock("operator1.swarmcompute.eth", "0x1111111111111111111111111111111111111111")
+        self._register_mock("operator2.swarmcompute.eth", "0x2222222222222222222222222222222222222222")
         self._register_mock("client1.swarmvision.eth", "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         self._register_mock("client2.swarmvision.eth", "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 
@@ -178,10 +178,16 @@ class IdentityService:
         )
 
     def _determine_role(self, ens_name: str) -> IdentityRole:
-        """Determine role from ENS name."""
+        """Determine role from ENS name.
+
+        Identity namespaces:
+        - *.swarmcompute.eth → OPERATOR (runs SwarmAgent, executes jobs)
+        - *.swarmvision.eth  → CLIENT (submits jobs, consumes compute)
+        - *.eth (generic)    → CLIENT (default for other ENS names)
+        """
         name = ens_name.lower()
 
-        if ".swarmagent.eth" in name or name.endswith("swarmagent.eth"):
+        if ".swarmcompute.eth" in name or name.endswith("swarmcompute.eth"):
             return IdentityRole.OPERATOR
         elif ".swarmvision.eth" in name or name.endswith("swarmvision.eth"):
             return IdentityRole.CLIENT
@@ -214,11 +220,11 @@ class IdentityService:
 
     def register_operator(self, ens_name: str, address: str) -> bool:
         """Register a new operator identity."""
-        if not ens_name.endswith(".swarmagent.eth"):
+        if not ens_name.endswith(".swarmcompute.eth"):
             # Auto-suffix if needed
             if ens_name.endswith(".eth"):
                 return False  # Wrong domain
-            ens_name = f"{ens_name}.swarmagent.eth"
+            ens_name = f"{ens_name}.swarmcompute.eth"
 
         return self.resolver.register(ens_name, address)
 

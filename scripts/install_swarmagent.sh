@@ -78,7 +78,7 @@ echo
 echo "Next steps:"
 echo
 echo "1. Register your agent:"
-echo "   swarmagent register --ens yourname.swarmagent.eth"
+echo "   swarmagent register --ens yourname.swarmcompute.eth"
 echo
 echo "2. Start earning:"
 echo "   swarmagent start"

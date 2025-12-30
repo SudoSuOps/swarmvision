@@ -9,7 +9,7 @@ The SwarmAgent CLI provides:
 - Manual proof generation for testing
 
 Usage:
-    swarmagent register --ens mynode.swarmagent.eth
+    swarmagent register --ens mynode.swarmcompute.eth
     swarmagent start
     swarmagent status
     swarmagent capabilities
@@ -84,7 +84,7 @@ def cmd_start(args):
         for e in errors:
             print(f"  - {e}")
         print()
-        print("Run: swarmagent register --ens yourname.swarmagent.eth")
+        print("Run: swarmagent register --ens yourname.swarmcompute.eth")
         sys.exit(1)
 
     # Start agent
@@ -147,19 +147,42 @@ def cmd_capabilities(args):
         "vram_total_gb": hardware.vram_total_gb,
         "cpu_cores": hardware.cpu_cores,
         "ram_gb": hardware.ram_gb,
+        "cuda_version": hardware.cuda_version,
+        "driver_version": hardware.driver_version,
+        "total_power_draw_w": hardware.total_power_draw_w,
+        "total_power_limit_w": hardware.total_power_limit_w,
+        "gpus": hardware.gpus,
     }
 
     if args.json:
         print(json.dumps(output, indent=2))
     else:
         print("Hardware Capabilities")
-        print("=" * 40)
+        print("=" * 50)
+        print(f"CUDA Version:    {hardware.cuda_version or 'N/A'}")
+        print(f"Driver Version:  {hardware.driver_version or 'N/A'}")
+        print()
         print(f"GPUs: {hardware.gpu_count}")
-        for i, name in enumerate(hardware.gpu_names):
-            print(f"  [{i}] {name}")
-        print(f"VRAM: {hardware.vram_total_gb} GB total")
-        print(f"CPU:  {hardware.cpu_cores} cores")
-        print(f"RAM:  {hardware.ram_gb} GB")
+        if hardware.gpus:
+            for gpu in hardware.gpus:
+                print(f"  [{gpu['index']}] {gpu['name']}")
+                print(f"      VRAM:  {gpu['vram_free_mb']}/{gpu['vram_total_mb']} MB free")
+                print(f"      Power: {gpu['power_draw_w']:.1f}/{gpu['power_limit_w']:.0f} W")
+                print(f"      Temp:  {gpu['temperature_c']}°C  Util: {gpu['utilization_pct']}%")
+                print(f"      Compute: SM {gpu['compute_capability']}")
+        else:
+            for i, name in enumerate(hardware.gpu_names):
+                print(f"  [{i}] {name}")
+        print()
+        print(f"VRAM Total:      {hardware.vram_total_gb} GB")
+        if hardware.gpus:
+            avail = hardware.get_available_vram_gb()
+            print(f"VRAM Available:  {avail:.2f} GB")
+        print(f"Power Draw:      {hardware.total_power_draw_w or 0:.1f} W")
+        print(f"Power Limit:     {hardware.total_power_limit_w or 0:.1f} W")
+        print()
+        print(f"CPU Cores:       {hardware.cpu_cores}")
+        print(f"RAM:             {hardware.ram_gb} GB")
 
 
 def cmd_prove(args):
@@ -170,7 +193,7 @@ def cmd_prove(args):
         config = AgentConfig.from_file(config_path)
         ens_name = config.ens_name
     else:
-        ens_name = args.ens or "test.swarmagent.eth"
+        ens_name = args.ens or "test.swarmcompute.eth"
 
     proof = create_proof(
         agent_ens=ens_name,
@@ -189,7 +212,7 @@ def cmd_prove(args):
 
 def cmd_version(args):
     """Show version."""
-    print("SwarmAgent v0.1.0")
+    print("SwarmAgent v0.2.0")
     print("SwarmVision Protocol Reference Implementation")
 
 
@@ -206,7 +229,7 @@ def main():
 
     # register
     p_register = subparsers.add_parser("register", help="Register agent identity")
-    p_register.add_argument("--ens", required=True, help="ENS name (e.g., mynode.swarmagent.eth)")
+    p_register.add_argument("--ens", required=True, help="ENS name (e.g., mynode.swarmcompute.eth)")
     p_register.add_argument("--private-key", help="Wallet private key (hex)")
     p_register.add_argument("--coordinator", help="SwarmVision OS URL")
     p_register.set_defaults(func=cmd_register)

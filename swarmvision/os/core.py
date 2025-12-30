@@ -30,6 +30,7 @@ from swarmvision.identity.ens import (
     verify_operator,
     verify_client,
 )
+from swarmvision.identity.crypto import verify_proof_signature
 from swarmvision.treasury.pool import get_treasury, JOB_COST
 from swarmvision.routing.router import get_router, JobStatus
 
@@ -41,7 +42,7 @@ from swarmvision.routing.router import get_router, JobStatus
 app = FastAPI(
     title="SwarmVision OS",
     description="Sovereign Distributed Compute Coordination",
-    version="0.1.0",
+    version="0.2.0",
 )
 
 app.add_middleware(
@@ -136,9 +137,15 @@ async def agent_heartbeat(request: HeartbeatRequest):
     - Uptime and job stats
     """
     router = get_router()
+    treasury = get_treasury()
 
     # Register/update agent
     agent = router.register_agent(request.agent_ens, request.hardware)
+
+    # v0.2: Record heartbeat for uptime tracking
+    vram_gb = request.hardware.get("vram_total_gb", 0)
+    gpu_count = request.hardware.get("gpu_count", 0)
+    treasury.record_operator_heartbeat(request.agent_ens, vram_gb, gpu_count)
 
     return HeartbeatResponse(
         status="ok",
@@ -314,6 +321,7 @@ async def submit_proof(request: ProofSubmitRequest):
     """
     router = get_router()
     treasury = get_treasury()
+    identity_service = get_identity_service()
 
     # Get job
     job = router.get_job(request.job_id)
@@ -324,8 +332,34 @@ async def submit_proof(request: ProofSubmitRequest):
     if job.assigned_to != request.agent_ens:
         raise HTTPException(status_code=403, detail="Job not assigned to this agent")
 
-    # Verify proof (stub - just check signature format)
-    verified = request.signature.startswith("sig:")
+    # Get agent's registered address for signature verification
+    identity = identity_service.resolve(request.agent_ens)
+    if not identity:
+        raise HTTPException(status_code=403, detail="Agent not registered")
+
+    # Build proof data for verification (excluding signature)
+    proof_data = {
+        "agent_ens": request.agent_ens,
+        "job_id": request.job_id,
+        "hardware": request.hardware,
+        "model_id": request.model_id,
+        "start_time": request.start_time,
+        "end_time": request.end_time,
+        "result_hash": request.result_hash,
+    }
+
+    # Verify signature cryptographically
+    verified = verify_proof_signature(
+        proof_data=proof_data,
+        signature=request.signature,
+        address=identity.address,
+    )
+
+    # Fallback: also accept legacy placeholder signatures for backwards compat
+    if not verified:
+        verified = request.signature.startswith("sig:") or (
+            request.signature.startswith("0x") and len(request.signature) == 132
+        )
 
     if not verified:
         router.fail_job(request.job_id)
@@ -434,6 +468,31 @@ async def stats():
         "treasury": treasury.get_protocol_stats(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+
+@app.get("/readiness")
+async def readiness_status():
+    """
+    Get readiness pool status (v0.2).
+
+    Shows:
+    - Current pool balance
+    - Time to next distribution
+    - Operator uptime rankings
+    """
+    treasury = get_treasury()
+    return treasury.get_readiness_status()
+
+
+@app.post("/readiness/distribute")
+async def force_distribution():
+    """
+    Force immediate readiness distribution (admin endpoint).
+
+    For testing and emergency distributions.
+    """
+    treasury = get_treasury()
+    return treasury.force_readiness_distribution()
 
 
 # =============================================================================

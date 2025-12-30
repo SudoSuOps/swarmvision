@@ -51,7 +51,7 @@ Agents register their Tailscale IP with SwarmVision OS:
 
 ```json
 {
-  "agent_ens": "operator1.swarmagent.eth",
+  "agent_ens": "operator1.swarmcompute.eth",
   "tailscale_ip": "100.x.x.x",
   "tailscale_hostname": "agent-operator1"
 }

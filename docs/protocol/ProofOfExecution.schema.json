@@ -1,0 +1,87 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://swarmvision.io/protocol/v0.2/ProofOfExecution.schema.json",
+  "title": "ProofOfExecution",
+  "description": "Proof that a specific agent executed a specific job on specific hardware. This schema is FROZEN as of v0.2.",
+  "type": "object",
+  "required": [
+    "agent_ens",
+    "job_id",
+    "hardware",
+    "model_id",
+    "start_time",
+    "end_time",
+    "result_hash",
+    "signature"
+  ],
+  "properties": {
+    "agent_ens": {
+      "type": "string",
+      "description": "ENS name of the operator (*.swarmcompute.eth)",
+      "pattern": "^[a-z0-9-]+\\.swarmcompute\\.eth$"
+    },
+    "job_id": {
+      "type": "string",
+      "description": "Unique job identifier",
+      "pattern": "^job_[a-f0-9]{12}$"
+    },
+    "hardware": {
+      "type": "object",
+      "description": "Hardware capabilities at time of execution",
+      "required": ["gpu_count", "vram_total_gb", "cpu_cores", "ram_gb"],
+      "properties": {
+        "gpu_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of GPUs available"
+        },
+        "gpu_names": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Names of GPUs (e.g., 'NVIDIA RTX 4090')"
+        },
+        "vram_total_gb": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Total VRAM across all GPUs in GB"
+        },
+        "cpu_cores": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of CPU cores"
+        },
+        "ram_gb": {
+          "type": "number",
+          "minimum": 0,
+          "description": "System RAM in GB"
+        }
+      }
+    },
+    "model_id": {
+      "type": "string",
+      "description": "Identifier of the model/pipeline executed",
+      "minLength": 1
+    },
+    "start_time": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO8601 timestamp when execution started"
+    },
+    "end_time": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO8601 timestamp when execution completed"
+    },
+    "result_hash": {
+      "type": "string",
+      "description": "SHA256 hash of the execution result",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "signature": {
+      "type": "string",
+      "description": "ECDSA signature over proof hash (secp256k1)",
+      "pattern": "^0x[a-f0-9]{130}$"
+    }
+  },
+  "additionalProperties": false
+}
