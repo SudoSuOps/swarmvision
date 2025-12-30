@@ -35,10 +35,12 @@ from swarmvision.identity.poe import validate_poe, extract_poe_metrics
 from swarmvision.treasury.pool import get_treasury, JOB_COST
 from swarmvision.treasury.distribution import (
     compute_epoch_payouts,
-    EpochLedger,
-    OperatorStats,
     TreasuryConfig,
     D,
+)
+from swarmvision.treasury.state import (
+    TreasuryEpochState,
+    current_epoch_window,
 )
 from swarmvision.routing.router import get_router, JobStatus
 
@@ -549,42 +551,29 @@ async def get_transactions(ens_name: str, limit: int = Query(default=50, le=100)
 # EPOCH ENDPOINTS
 # =============================================================================
 
-class EpochState:
-    """Tracks current epoch for distribution."""
-    def __init__(self):
-        self.epoch_id = 0
-        self.epoch_start = datetime.now(timezone.utc)
-        self.gross_revenue = D("0")
-        self.refunds = D("0")
-        self.job_records: list[dict] = []
-
-    def record_job(self, job_id: str, client_ens: str, operator_ens: str, amount: int):
-        """Record a completed job for this epoch."""
-        self.gross_revenue += D(amount)
-        self.job_records.append({
-            "job_id": job_id,
-            "client_ens": client_ens,
-            "operator_ens": operator_ens,
-            "amount": amount,
-        })
-
-    def record_refund(self, amount: int):
-        """Record a refund for this epoch."""
-        self.refunds += D(amount)
-
-    def reset(self):
-        """Reset for next epoch."""
-        self.epoch_id += 1
-        self.epoch_start = datetime.now(timezone.utc)
-        self.gross_revenue = D("0")
-        self.refunds = D("0")
-        self.job_records = []
+_epoch_state: TreasuryEpochState | None = None
 
 
-_epoch_state = EpochState()
+def get_epoch_state() -> TreasuryEpochState:
+    global _epoch_state
+    if _epoch_state is None:
+        start, end = current_epoch_window(86400)
+        _epoch_state = TreasuryEpochState(
+            epoch_id=f"epoch_{start}",
+            epoch_start_ts=start,
+            epoch_end_ts=end,
+        )
+    return _epoch_state
 
 
-def get_epoch_state() -> EpochState:
+def reset_epoch_state() -> TreasuryEpochState:
+    global _epoch_state
+    start, end = current_epoch_window(86400)
+    _epoch_state = TreasuryEpochState(
+        epoch_id=f"epoch_{start}",
+        epoch_start_ts=start,
+        epoch_end_ts=end,
+    )
     return _epoch_state
 
 
@@ -596,33 +585,14 @@ async def close_epoch():
     Gathers operator stats and revenue, runs distribution algorithm,
     applies payouts to operator accounts.
 
-    Returns signed PayoutReport.
+    Returns PayoutReport.
     """
     treasury = get_treasury()
     epoch = get_epoch_state()
 
-    # Build epoch ledger
-    ledger = EpochLedger(
-        gross_revenue=epoch.gross_revenue,
-        refunds=epoch.refunds,
-    )
-
-    # Gather operator stats from treasury uptime tracking
-    operators: list[OperatorStats] = []
-
-    for ens, uptime in treasury._operator_uptime.items():
-        # Get reputation data for job counts
-        rep = treasury._operator_reputation.get(ens)
-
-        operators.append(OperatorStats(
-            operator_ens=ens,
-            status="active" if uptime.is_online else "inactive",
-            uptime_seconds=int(uptime.epoch_online_seconds),
-            ready_seconds=int(uptime.epoch_online_seconds) if uptime.is_ready else 0,
-            jobs_success=rep.total_jobs_success if rep else 0,
-            jobs_failure=rep.total_jobs_failed if rep else 0,
-            poe_invalid=rep.proofs_rejected if rep else 0,
-        ))
+    # Build inputs from epoch state
+    ledger = epoch.to_ledger()
+    operators = epoch.to_operator_stats()
 
     # Compute payouts
     cfg = TreasuryConfig()
@@ -634,14 +604,14 @@ async def close_epoch():
             treasury.deposit(
                 payout.operator_ens,
                 int(payout.payout),
-                reference=f"epoch:{epoch.epoch_id}:distribution"
+                reference=f"{epoch.epoch_id}:distribution"
             )
 
     # Build response
     result = {
         "epoch_id": epoch.epoch_id,
-        "epoch_start": epoch.epoch_start.isoformat(),
-        "epoch_end": datetime.now(timezone.utc).isoformat(),
+        "epoch_start_ts": epoch.epoch_start_ts,
+        "epoch_end_ts": epoch.epoch_end_ts,
         "gross_revenue": str(report.gross_revenue),
         "protocol_fee": str(report.protocol_fee),
         "refunds": str(report.refunds),
@@ -665,7 +635,7 @@ async def close_epoch():
     }
 
     # Reset epoch state for next period
-    epoch.reset()
+    reset_epoch_state()
 
     return result
 
@@ -675,14 +645,16 @@ async def epoch_status():
     """Get current epoch status."""
     epoch = get_epoch_state()
     treasury = get_treasury()
+    import time
 
     return {
         "epoch_id": epoch.epoch_id,
-        "epoch_start": epoch.epoch_start.isoformat(),
-        "duration_seconds": (datetime.now(timezone.utc) - epoch.epoch_start).total_seconds(),
+        "epoch_start_ts": epoch.epoch_start_ts,
+        "epoch_end_ts": epoch.epoch_end_ts,
+        "seconds_remaining": max(0, epoch.epoch_end_ts - int(time.time())),
         "gross_revenue": str(epoch.gross_revenue),
         "refunds": str(epoch.refunds),
-        "jobs_this_epoch": len(epoch.job_records),
+        "operators_tracked": len(epoch.operators),
         "operators_online": len(treasury.get_online_operators()),
     }
 
