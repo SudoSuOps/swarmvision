@@ -1,0 +1,41 @@
+# SwarmVision OS Docker Image
+# Coordination layer for distributed compute
+
+FROM python:3.11-slim
+
+LABEL maintainer="SwarmVision Protocol"
+LABEL description="SwarmVision OS - Coordination Layer"
+LABEL version="0.1.0"
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -s /bin/bash swarmvision
+WORKDIR /home/swarmvision
+
+# Copy source
+COPY --chown=swarmvision:swarmvision swarmvision/ ./swarmvision/
+COPY --chown=swarmvision:swarmvision requirements.txt ./
+
+# Install Python dependencies
+RUN pip install --no-cache-dir fastapi uvicorn pydantic
+
+# Switch to non-root user
+USER swarmvision
+
+# Environment
+ENV PYTHONUNBUFFERED=1
+ENV PORT=8000
+
+# Expose API port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Entry point
+ENTRYPOINT ["python3", "-m", "swarmvision.os.core"]

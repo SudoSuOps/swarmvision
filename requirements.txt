@@ -1,0 +1,13 @@
+# SwarmVision Protocol Dependencies
+
+# Core
+fastapi>=0.100.0
+uvicorn>=0.23.0
+pydantic>=2.0.0
+
+# Agent (optional - for async HTTP)
+aiohttp>=3.8.0
+
+# Development
+pytest>=7.0.0
+httpx>=0.24.0

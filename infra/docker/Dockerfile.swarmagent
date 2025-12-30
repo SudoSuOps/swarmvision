@@ -1,0 +1,48 @@
+# SwarmAgent Docker Image
+# Execution daemon for SwarmVision distributed compute
+
+FROM nvidia/cuda:12.4-runtime-ubuntu22.04
+
+LABEL maintainer="SwarmVision Protocol"
+LABEL description="SwarmAgent - Distributed Compute Daemon"
+LABEL version="0.1.0"
+
+# Install Python and dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-venv \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -s /bin/bash swarmagent
+WORKDIR /home/swarmagent
+
+# Copy source
+COPY --chown=swarmagent:swarmagent swarmagent/ ./swarmagent/
+COPY --chown=swarmagent:swarmagent requirements.txt ./
+
+# Install Python dependencies
+RUN pip3 install --no-cache-dir -r requirements.txt || true
+
+# Switch to non-root user
+USER swarmagent
+
+# Create config directory
+RUN mkdir -p /home/swarmagent/.swarmagent
+
+# Environment
+ENV PYTHONUNBUFFERED=1
+ENV SWARMAGENT_ENS=""
+ENV SWARMVISION_URL="http://swarmvision:8000"
+
+# Expose no ports (agent is outbound-only)
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python3 -c "import swarmagent.proof.execution; print('ok')"
+
+# Entry point
+ENTRYPOINT ["python3", "-m", "swarmagent.cli.main"]
+CMD ["start", "--foreground"]
