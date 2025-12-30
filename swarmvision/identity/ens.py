@@ -1,273 +1,390 @@
 """
-SwarmVision Protocol — ENS Identity
+SwarmVision Protocol — ENS Identity Resolution
 
-Identity in SwarmVision is based on ENS (Ethereum Name Service).
-No emails, no passwords — just cryptographic signatures.
+Implements ENS.resolution.md spec (v0.2 FINAL).
 
-Naming conventions:
-- *.swarmcompute.eth → Compute operators (agents running SwarmAgent)
-- *.swarmvision.eth  → Clients (job submitters)
+Two canonical roots:
+- swarmvision.eth → Clients
+- swarmcompute.eth → Operators
 
-This module provides:
-- ENS resolution (mocked for now, pluggable for real ENS)
-- Identity verification via signatures
-- Role determination (operator vs client)
+No emails. No passwords. Wallet signatures only.
 """
 
-import hashlib
 import re
-from dataclasses import dataclass
+import hashlib
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Optional, List
+from datetime import datetime, timezone
 
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+# Canonical roots
+CLIENT_ROOT = "swarmvision.eth"
+OPERATOR_ROOT = "swarmcompute.eth"
+
+# Patterns (normative)
+CLIENT_PATTERN = re.compile(r"^[a-z0-9-]+\.swarmvision\.eth$")
+OPERATOR_PATTERN = re.compile(r"^[a-z0-9-]+\.swarmcompute\.eth$")
+
+# Reserved labels (MUST NOT be issued)
+RESERVED_LABELS = frozenset([
+    "www", "api", "docs", "schemas", "admin", "root",
+    "treasury", "registry", "status", "health"
+])
+
+
+# =============================================================================
+# DATA STRUCTURES
+# =============================================================================
 
 class IdentityRole(Enum):
-    """Role in the SwarmVision network."""
-    OPERATOR = "operator"  # Runs SwarmAgent, executes jobs
-    CLIENT = "client"      # Submits jobs, consumes compute
+    """Identity role derived from ENS namespace."""
+    CLIENT = "client"
+    OPERATOR = "operator"
+    UNKNOWN = "unknown"
+
+
+class IdentityStatus(Enum):
+    """Identity status from ENS text record."""
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+    DRAINING = "draining"
+    INACTIVE = "inactive"
     UNKNOWN = "unknown"
 
 
 @dataclass
+class ENSRecord:
+    """ENS text record."""
+    key: str
+    value: str
+
+
+@dataclass
 class Identity:
-    """A verified identity in SwarmVision."""
+    """
+    Resolved ENS identity.
+
+    Contains everything needed for authorization.
+    """
     ens_name: str
-    address: str  # Ethereum address (0x...)
     role: IdentityRole
-    verified: bool = False
+    status: IdentityStatus
+    address: str  # Owner/controller wallet
+    controllers: List[str] = field(default_factory=list)
+    records: dict = field(default_factory=dict)
+    resolved_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     @property
-    def is_operator(self) -> bool:
-        return self.role == IdentityRole.OPERATOR
+    def is_active(self) -> bool:
+        """Check if identity is active."""
+        return self.status == IdentityStatus.ACTIVE
 
     @property
     def is_client(self) -> bool:
+        """Check if identity is a client."""
         return self.role == IdentityRole.CLIENT
 
+    @property
+    def is_operator(self) -> bool:
+        """Check if identity is an operator."""
+        return self.role == IdentityRole.OPERATOR
+
+    def is_authorized_wallet(self, wallet: str) -> bool:
+        """Check if wallet is authorized for this identity."""
+        wallet_lower = wallet.lower()
+        if self.address.lower() == wallet_lower:
+            return True
+        return any(c.lower() == wallet_lower for c in self.controllers)
+
+
+@dataclass
+class ResolutionResult:
+    """Result of ENS resolution."""
+    success: bool
+    identity: Optional[Identity] = None
+    error: Optional[str] = None
+
 
 # =============================================================================
-# ENS RESOLVER (Mock Implementation)
+# ENS SERVICE
 # =============================================================================
 
-class ENSResolver:
+class ENSService:
     """
-    ENS name resolution.
+    ENS identity resolution service.
 
-    This is a mock implementation using a local dictionary.
-    In production, this would query the Ethereum mainnet or
-    a dedicated ENS deployment.
-
-    The interface is designed for easy replacement.
+    v0.2: In-memory mock with correct resolution algorithm.
+    Production: Replace with real ENS resolution (ethers/web3).
     """
 
     def __init__(self):
-        # Mock registry: ens_name -> ethereum_address
-        self._registry: dict[str, str] = {}
+        # Mock registry: ens_name -> Identity
+        self._registry: dict[str, Identity] = {}
+        # Controller mappings: ens_name -> [wallet addresses]
+        self._controllers: dict[str, List[str]] = {}
 
-        # Pre-register some test identities
-        self._register_mock("operator1.swarmcompute.eth", "0x1111111111111111111111111111111111111111")
-        self._register_mock("operator2.swarmcompute.eth", "0x2222222222222222222222222222222222222222")
-        self._register_mock("client1.swarmvision.eth", "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        self._register_mock("client2.swarmvision.eth", "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-
-    def _register_mock(self, ens_name: str, address: str):
-        """Register a mock ENS entry."""
-        self._registry[ens_name.lower()] = address.lower()
-
-    def resolve(self, ens_name: str) -> Optional[str]:
+    def register(
+        self,
+        ens_name: str,
+        address: str,
+        controllers: Optional[List[str]] = None,
+        records: Optional[dict] = None
+    ) -> ResolutionResult:
         """
-        Resolve ENS name to Ethereum address.
+        Register an ENS identity (mock).
 
-        Returns None if not found.
+        In production, this reads from ENS on-chain.
         """
-        name = ens_name.lower()
-
-        # Check mock registry
-        if name in self._registry:
-            return self._registry[name]
-
-        # Auto-generate address for unregistered names (for testing)
-        # In production, this would return None
-        if name.endswith(".eth"):
-            # Generate deterministic address from name
-            hash_bytes = hashlib.sha256(name.encode()).digest()
-            address = "0x" + hash_bytes[:20].hex()
-            self._registry[name] = address
-            return address
-
-        return None
-
-    def reverse_resolve(self, address: str) -> Optional[str]:
-        """
-        Reverse resolve: address -> ENS name.
-
-        Returns None if not found.
-        """
-        addr = address.lower()
-        for name, registered_addr in self._registry.items():
-            if registered_addr == addr:
-                return name
-        return None
-
-    def register(self, ens_name: str, address: str) -> bool:
-        """
-        Register an ENS name (mock).
-
-        In production, this would be an on-chain transaction.
-        """
-        name = ens_name.lower()
-
-        # Validate name format
-        if not self._validate_name(name):
-            return False
-
-        # Check if already registered to different address
-        existing = self._registry.get(name)
-        if existing and existing != address.lower():
-            return False
-
-        self._registry[name] = address.lower()
-        return True
-
-    def _validate_name(self, name: str) -> bool:
-        """Validate ENS name format."""
-        # Must end with .eth
-        if not name.endswith(".eth"):
-            return False
-
-        # Must have at least one subdomain
-        parts = name.split(".")
-        if len(parts) < 2:
-            return False
-
-        # Alphanumeric + hyphens only
-        pattern = r"^[a-z0-9-]+(\.[a-z0-9-]+)*\.eth$"
-        return bool(re.match(pattern, name))
-
-
-# =============================================================================
-# IDENTITY SERVICE
-# =============================================================================
-
-class IdentityService:
-    """
-    Identity management for SwarmVision.
-
-    Handles:
-    - ENS resolution
-    - Role determination
-    - Signature verification (stubbed)
-    """
-
-    def __init__(self, resolver: Optional[ENSResolver] = None):
-        self.resolver = resolver or ENSResolver()
-
-    def resolve(self, ens_name: str) -> Optional[Identity]:
-        """Resolve ENS name to full identity."""
-        address = self.resolver.resolve(ens_name)
-        if not address:
-            return None
-
+        # Validate pattern
         role = self._determine_role(ens_name)
+        if role == IdentityRole.UNKNOWN:
+            return ResolutionResult(
+                success=False,
+                error=f"Invalid ENS pattern: {ens_name}"
+            )
 
-        return Identity(
+        # Check reserved labels
+        label = ens_name.split(".")[0]
+        if label in RESERVED_LABELS:
+            return ResolutionResult(
+                success=False,
+                error=f"Reserved label: {label}"
+            )
+
+        # Create identity
+        identity = Identity(
             ens_name=ens_name,
-            address=address,
             role=role,
-            verified=True,
+            status=IdentityStatus.ACTIVE,
+            address=address,
+            controllers=controllers or [],
+            records=records or {},
         )
 
-    def _determine_role(self, ens_name: str) -> IdentityRole:
-        """Determine role from ENS name.
+        self._registry[ens_name] = identity
+        self._controllers[ens_name] = controllers or []
 
-        Identity namespaces:
-        - *.swarmcompute.eth → OPERATOR (runs SwarmAgent, executes jobs)
-        - *.swarmvision.eth  → CLIENT (submits jobs, consumes compute)
-        - *.eth (generic)    → CLIENT (default for other ENS names)
+        return ResolutionResult(success=True, identity=identity)
+
+    def resolve(self, ens_name: str) -> Optional[Identity]:
         """
-        name = ens_name.lower()
+        Resolve ENS name to identity.
 
-        if ".swarmcompute.eth" in name or name.endswith("swarmcompute.eth"):
-            return IdentityRole.OPERATOR
-        elif ".swarmvision.eth" in name or name.endswith("swarmvision.eth"):
-            return IdentityRole.CLIENT
-        else:
-            # Generic .eth names are clients by default
-            return IdentityRole.CLIENT
+        Resolution algorithm (from spec):
+        1. Validate pattern
+        2. Resolve owner + controllers
+        3. Fetch role + status records
+        4. Return identity or None
+        """
+        # Step 1: Validate pattern
+        role = self._determine_role(ens_name)
+        if role == IdentityRole.UNKNOWN:
+            return None
 
-    def verify_signature(
+        # Step 2-3: Look up in registry
+        identity = self._registry.get(ens_name)
+        if identity:
+            return identity
+
+        # Auto-register with mock address (for testing)
+        address = self._mock_address(ens_name)
+        result = self.register(ens_name, address)
+        return result.identity
+
+    def resolve_client(self, client_ens: str) -> ResolutionResult:
+        """
+        Resolve client identity.
+
+        From spec section 6.1:
+        1. Validate pattern (*.swarmvision.eth)
+        2. Resolve ENS owner + controllers
+        3. Fetch role + status records
+        4. Confirm role == "client"
+        5. Confirm status == "active"
+        """
+        if not CLIENT_PATTERN.match(client_ens):
+            return ResolutionResult(
+                success=False,
+                error="Invalid client ENS pattern"
+            )
+
+        identity = self.resolve(client_ens)
+        if not identity:
+            return ResolutionResult(
+                success=False,
+                error="Failed to resolve ENS"
+            )
+
+        if identity.role != IdentityRole.CLIENT:
+            return ResolutionResult(
+                success=False,
+                error=f"Expected client role, got {identity.role.value}"
+            )
+
+        if not identity.is_active:
+            return ResolutionResult(
+                success=False,
+                error=f"Identity not active: {identity.status.value}"
+            )
+
+        return ResolutionResult(success=True, identity=identity)
+
+    def resolve_operator(self, operator_ens: str) -> ResolutionResult:
+        """
+        Resolve operator identity.
+
+        From spec section 6.2:
+        1. Validate pattern (*.swarmcompute.eth)
+        2. Resolve ENS owner + controllers
+        3. Fetch role + status records
+        4. Confirm role == "operator"
+        5. Confirm status == "active"
+        """
+        if not OPERATOR_PATTERN.match(operator_ens):
+            return ResolutionResult(
+                success=False,
+                error="Invalid operator ENS pattern"
+            )
+
+        identity = self.resolve(operator_ens)
+        if not identity:
+            return ResolutionResult(
+                success=False,
+                error="Failed to resolve ENS"
+            )
+
+        if identity.role != IdentityRole.OPERATOR:
+            return ResolutionResult(
+                success=False,
+                error=f"Expected operator role, got {identity.role.value}"
+            )
+
+        if not identity.is_active:
+            return ResolutionResult(
+                success=False,
+                error=f"Identity not active: {identity.status.value}"
+            )
+
+        return ResolutionResult(success=True, identity=identity)
+
+    def verify_signature_authority(
         self,
-        message: str,
-        signature: str,
-        expected_address: str
+        ens_name: str,
+        wallet_address: str
     ) -> bool:
         """
-        Verify a signature against an expected address.
+        Verify wallet is authorized to sign for ENS identity.
 
-        STUB: In production, this would use ECDSA recovery.
+        From spec section 4.2:
+        - Owner wallet, OR
+        - Approved controller
         """
-        # Placeholder verification
-        # Real implementation would:
-        # 1. Hash the message (EIP-191 personal sign)
-        # 2. Recover signer address from signature
-        # 3. Compare with expected address
+        identity = self.resolve(ens_name)
+        if not identity:
+            return False
 
-        if signature.startswith("sig:"):
-            # Accept our placeholder signatures
-            return True
+        if not identity.is_active:
+            return False
 
-        return False
+        return identity.is_authorized_wallet(wallet_address)
 
-    def register_operator(self, ens_name: str, address: str) -> bool:
-        """Register a new operator identity."""
-        if not ens_name.endswith(".swarmcompute.eth"):
-            # Auto-suffix if needed
-            if ens_name.endswith(".eth"):
-                return False  # Wrong domain
-            ens_name = f"{ens_name}.swarmcompute.eth"
+    def set_status(self, ens_name: str, status: IdentityStatus) -> bool:
+        """
+        Set identity status.
 
-        return self.resolver.register(ens_name, address)
+        From spec section 9.1:
+        - Set suspended/inactive for immediate revocation
+        """
+        identity = self._registry.get(ens_name)
+        if not identity:
+            return False
 
-    def register_client(self, ens_name: str, address: str) -> bool:
-        """Register a new client identity."""
-        if not ens_name.endswith(".swarmvision.eth"):
-            if ens_name.endswith(".eth"):
-                # Allow generic .eth for clients
-                pass
-            else:
-                ens_name = f"{ens_name}.swarmvision.eth"
+        identity.status = status
+        return True
 
-        return self.resolver.register(ens_name, address)
+    def add_controller(self, ens_name: str, wallet: str) -> bool:
+        """Add authorized controller wallet."""
+        identity = self._registry.get(ens_name)
+        if not identity:
+            return False
+
+        if wallet.lower() not in [c.lower() for c in identity.controllers]:
+            identity.controllers.append(wallet)
+
+        return True
+
+    def remove_controller(self, ens_name: str, wallet: str) -> bool:
+        """Remove authorized controller wallet."""
+        identity = self._registry.get(ens_name)
+        if not identity:
+            return False
+
+        wallet_lower = wallet.lower()
+        identity.controllers = [
+            c for c in identity.controllers
+            if c.lower() != wallet_lower
+        ]
+
+        return True
+
+    def _determine_role(self, ens_name: str) -> IdentityRole:
+        """Determine role from ENS namespace."""
+        if CLIENT_PATTERN.match(ens_name):
+            return IdentityRole.CLIENT
+        elif OPERATOR_PATTERN.match(ens_name):
+            return IdentityRole.OPERATOR
+        return IdentityRole.UNKNOWN
+
+    def _mock_address(self, ens_name: str) -> str:
+        """Generate deterministic mock address."""
+        hash_bytes = hashlib.sha256(ens_name.encode()).digest()
+        return "0x" + hash_bytes[:20].hex()
 
 
 # =============================================================================
 # GLOBAL INSTANCE
 # =============================================================================
 
-# Shared identity service instance
-_identity_service: Optional[IdentityService] = None
+_ens_service: Optional[ENSService] = None
 
 
-def get_identity_service() -> IdentityService:
-    """Get the global identity service instance."""
-    global _identity_service
-    if _identity_service is None:
-        _identity_service = IdentityService()
-    return _identity_service
+def get_identity_service() -> ENSService:
+    """Get global ENS service instance."""
+    global _ens_service
+    if _ens_service is None:
+        _ens_service = ENSService()
+    return _ens_service
 
+
+# =============================================================================
+# CONVENIENCE FUNCTIONS
+# =============================================================================
 
 def resolve_identity(ens_name: str) -> Optional[Identity]:
-    """Convenience function to resolve an identity."""
+    """Resolve ENS name to identity."""
     return get_identity_service().resolve(ens_name)
 
 
-def verify_operator(ens_name: str) -> bool:
-    """Check if an ENS name is a valid operator."""
-    identity = resolve_identity(ens_name)
-    return identity is not None and identity.is_operator
+def verify_operator(operator_ens: str) -> ResolutionResult:
+    """Verify operator identity."""
+    return get_identity_service().resolve_operator(operator_ens)
 
 
-def verify_client(ens_name: str) -> bool:
-    """Check if an ENS name is a valid client."""
-    identity = resolve_identity(ens_name)
-    return identity is not None and identity.is_client
+def verify_client(client_ens: str) -> ResolutionResult:
+    """Verify client identity."""
+    return get_identity_service().resolve_client(client_ens)
+
+
+def is_valid_client_ens(ens_name: str) -> bool:
+    """Check if ENS name is valid client pattern."""
+    return bool(CLIENT_PATTERN.match(ens_name))
+
+
+def is_valid_operator_ens(ens_name: str) -> bool:
+    """Check if ENS name is valid operator pattern."""
+    return bool(OPERATOR_PATTERN.match(ens_name))

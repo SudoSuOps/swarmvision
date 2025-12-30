@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from .crypto import verify_signature
+from .ens import get_identity_service, is_valid_operator_ens
 
 
 @dataclass
@@ -55,15 +56,12 @@ def validate_poe(poe: dict) -> PoEValidationResult:
     """
     Validate a Proof of Execution.
 
-    Steps:
-    1. Check required fields
-    2. Extract and remove signature block
-    3. Canonicalize remaining data
-    4. Compute message hash
-    5. Verify hash matches claimed hash
-    6. Verify signature against operator wallet
+    From ENS.resolution.md section 8:
+    1. Wallet is authorized for operator_ens
+    2. Signature matches PoE message hash
+    3. ENS status was active at execution time
 
-    Returns PoEValidationResult with valid=True or error message.
+    Any check fails → PoE invalid.
     """
     # Check required top-level fields
     required = ["protocol", "poe_id", "job", "operator", "execution",
@@ -82,12 +80,29 @@ def validate_poe(poe: dict) -> PoEValidationResult:
 
     # Check operator
     operator = poe.get("operator", {})
+    operator_ens = operator.get("operator_ens", "")
+
+    if not operator_ens:
+        return PoEValidationResult(valid=False, error="Missing operator_ens")
+
+    if not is_valid_operator_ens(operator_ens):
+        return PoEValidationResult(valid=False, error="Invalid operator ENS pattern")
+
     if "wallet" not in operator:
         return PoEValidationResult(valid=False, error="Missing operator.wallet")
 
     wallet_address = operator.get("wallet", {}).get("address", "")
     if not wallet_address.startswith("0x") or len(wallet_address) != 42:
         return PoEValidationResult(valid=False, error="Invalid wallet address")
+
+    # Verify wallet is authorized for operator_ens (from ENS.resolution.md section 8)
+    ens_service = get_identity_service()
+    if not ens_service.verify_signature_authority(operator_ens, wallet_address):
+        return PoEValidationResult(
+            valid=False,
+            error="Wallet not authorized for operator_ens",
+            operator_address=wallet_address
+        )
 
     # Extract signature block
     signature_block = poe.get("signature", {})
