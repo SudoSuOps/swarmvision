@@ -191,3 +191,24 @@ class TestDeterminism:
         report = compute_epoch_payouts(ledger, ops)
         assert report.net_pool == Decimal("0")
         assert report.payouts[0].payout == Decimal("0")
+
+
+def test_epoch_distribution_basic():
+    """Integration test: more jobs = more payout."""
+    cfg = TreasuryConfig(min_uptime_seconds=1)
+    ledger = EpochLedger(gross_revenue=Decimal("100.00"))
+
+    operators = [
+        OperatorStats("rig1.swarmcompute.eth", "active", 86400, 86400, 70, 0),
+        OperatorStats("rig2.swarmcompute.eth", "active", 86400, 86400, 30, 0),
+    ]
+
+    rpt = compute_epoch_payouts(ledger, operators, cfg)
+
+    total = sum(p.payout for p in rpt.payouts) + rpt.dust_rolled
+    assert total == rpt.net_pool
+
+    rig1 = next(p for p in rpt.payouts if p.operator_ens.startswith("rig1"))
+    rig2 = next(p for p in rpt.payouts if p.operator_ens.startswith("rig2"))
+
+    assert rig1.payout > rig2.payout
