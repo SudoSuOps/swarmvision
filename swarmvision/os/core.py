@@ -50,7 +50,7 @@ from swarmvision.routing.router import get_router, JobStatus
 import os
 
 # Protocol signing key (for signing payout reports)
-PROTOCOL_SIGNER_KEY = os.environ.get("SWARMVISION_SIGNER_KEY", "")
+PROTOCOL_SIGNER_KEY = os.environ.get("SWARMVISION_SIGNING_KEY", "")
 
 
 # =============================================================================
@@ -743,7 +743,7 @@ async def treasury_close_epoch():
     """
     Close current epoch and compute signed payout report.
 
-    Requires SWARMVISION_SIGNER_KEY environment variable.
+    Requires SWARMVISION_SIGNING_KEY environment variable.
     Returns signed PayoutReport for auditability.
     """
     import time
@@ -752,7 +752,7 @@ async def treasury_close_epoch():
     epoch = get_epoch_state()
 
     if not PROTOCOL_SIGNER_KEY:
-        raise HTTPException(500, "SWARMVISION_SIGNER_KEY not set")
+        raise HTTPException(500, "SWARMVISION_SIGNING_KEY not set")
 
     # Build inputs from epoch state
     ledger = epoch.to_ledger()
