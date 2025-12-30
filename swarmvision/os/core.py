@@ -42,7 +42,15 @@ from swarmvision.treasury.state import (
     TreasuryEpochState,
     current_epoch_window,
 )
+from swarmvision.treasury.report_signing import sign_payout_report
+from swarmvision.identity.signing import canonical_json_bytes, sha256_hex
+from swarmvision.identity.ethsig import recover_eip191_address
+from swarmvision.identity.ens import is_valid_operator_ens
 from swarmvision.routing.router import get_router, JobStatus
+import os
+
+# Protocol signing key (for signing payout reports)
+PROTOCOL_SIGNER_KEY = os.environ.get("SWARMVISION_SIGNER_KEY", "")
 
 
 # =============================================================================
@@ -134,6 +142,69 @@ class PoESubmitResponse(BaseModel):
     payment: Optional[int]
     reputation_score: Optional[float]
     error: Optional[str] = None
+
+
+# PoE v0.2 structured models
+class PoESignature(BaseModel):
+    scheme: str
+    message_hash: str
+    signature: str
+
+
+class PoEOperatorWallet(BaseModel):
+    chain: str
+    address: str
+
+
+class PoEOperator(BaseModel):
+    operator_ens: str
+    wallet: PoEOperatorWallet
+    agent: dict
+
+
+class PoEJobPricing(BaseModel):
+    currency: str
+    unit_price: str
+    unit: str
+
+
+class PoEJob(BaseModel):
+    job_id: str
+    client_ens: str
+    task: str
+    received_at: str
+    pricing: PoEJobPricing
+
+
+class PoEResult(BaseModel):
+    status: str
+    result_hash: str
+
+
+class PoEArtifact(BaseModel):
+    artifact_id: str
+    type: str
+    hash: str
+
+
+class PoEExecution(BaseModel):
+    started_at: str
+    ended_at: str
+    duration_ms: int
+    host: dict
+    resources: dict
+
+
+class ProofOfExecution(BaseModel):
+    protocol: dict
+    poe_id: str
+    job: PoEJob
+    operator: PoEOperator
+    execution: PoEExecution
+    artifact: PoEArtifact
+    result: PoEResult
+    attestations: dict
+    signature: PoESignature
 
 
 class AccountResponse(BaseModel):
@@ -405,8 +476,16 @@ async def submit_proof(request: ProofSubmitRequest):
     )
 
 
-@app.post("/poe/submit", response_model=PoESubmitResponse)
-async def submit_poe(poe: dict):
+def _is_client_ens(x: str) -> bool:
+    return x.endswith(".swarmvision.eth")
+
+
+def _is_operator_ens(x: str) -> bool:
+    return x.endswith(".swarmcompute.eth")
+
+
+@app.post("/poe/submit")
+async def submit_poe(poe: ProofOfExecution):
     """
     Submit Proof of Execution (v0.2 format).
 
@@ -418,61 +497,83 @@ async def submit_poe(poe: dict):
 
     No valid proof = no payout.
     """
-    router = get_router()
+    from decimal import Decimal
+
+    epoch = get_epoch_state()
     treasury = get_treasury()
 
-    # Validate PoE
-    result = validate_poe(poe)
+    # 1) Namespace checks
+    if not _is_client_ens(poe.job.client_ens):
+        raise HTTPException(400, "invalid client_ens namespace")
+    if not _is_operator_ens(poe.operator.operator_ens):
+        raise HTTPException(400, "invalid operator_ens namespace")
 
-    poe_id = poe.get("poe_id", "")
-    job_id = poe.get("job", {}).get("job_id", "")
-    operator_ens = poe.get("operator", {}).get("operator_ens", "")
+    # 2) Canonical signing rule: remove signature, hash
+    poe_dict = poe.model_dump()
+    sig_block = poe_dict.pop("signature", None)
+    b = canonical_json_bytes(poe_dict)
+    h = sha256_hex(b)
 
-    if not result.valid:
-        # Record rejected proof (damages reputation)
-        if operator_ens:
-            treasury.record_rejected_poe(operator_ens)
+    if sig_block is None:
+        raise HTTPException(400, "missing signature")
 
-        return PoESubmitResponse(
-            status="rejected",
-            poe_id=poe_id,
-            job_id=job_id,
-            verified=False,
-            payment=None,
-            reputation_score=None,
-            error=result.error,
-        )
+    if poe.signature.scheme != "eip191":
+        raise HTTPException(400, "unsupported signature scheme (v0.2 supports eip191)")
 
-    # Extract metrics from validated PoE
-    metrics = extract_poe_metrics(poe)
+    # 3) Verify message hash matches
+    if poe.signature.message_hash != h:
+        epoch.record_poe(poe.operator.operator_ens, success=False, poe_valid=False)
+        raise HTTPException(400, "message_hash mismatch")
 
-    # Complete job in router
-    job = router.get_job(job_id)
-    if job:
-        router.complete_job(job_id, poe.get("result", {}).get("result_hash", ""))
+    # 4) Recover signer and verify
+    try:
+        recovered = recover_eip191_address(h, poe.signature.signature)
+    except Exception:
+        epoch.record_poe(poe.operator.operator_ens, success=False, poe_valid=False)
+        raise HTTPException(401, "invalid signature")
 
-    # Process validated PoE - pay operator + update reputation
+    claimed = poe.operator.wallet.address.lower()
+    if recovered != claimed:
+        epoch.record_poe(poe.operator.operator_ens, success=False, poe_valid=False)
+        raise HTTPException(401, "signature does not match operator.wallet.address")
+
+    # 5) ENS authorization check (verify wallet controls ENS)
+    ens_service = get_identity_service()
+    if not ens_service.verify_signature_authority(poe.operator.operator_ens, claimed):
+        epoch.record_poe(poe.operator.operator_ens, success=False, poe_valid=False)
+        raise HTTPException(401, "wallet not authorized for operator_ens")
+
+    # 6) Accounting: revenue + stats
+    unit_price = Decimal(poe.job.pricing.unit_price)
+    epoch.record_job_charge(unit_price)
+
+    success = (poe.result.status == "success")
+    epoch.record_poe(poe.operator.operator_ens, success=success, poe_valid=True)
+
+    # 7) Process validated PoE in treasury
     tx = treasury.process_validated_poe(
-        operator_ens=metrics["operator_ens"],
-        job_id=metrics["job_id"],
-        duration_ms=metrics["duration_ms"],
-        result_status=metrics["result_status"],
-        gpu_count=metrics["gpu_count"],
-        vram_bytes=metrics["vram_bytes"],
+        operator_ens=poe.operator.operator_ens,
+        job_id=poe.job.job_id,
+        duration_ms=poe.execution.duration_ms,
+        result_status=poe.result.status,
+        gpu_count=len(poe.execution.resources.get("gpus", [])),
+        vram_bytes=sum(g.get("vram_bytes", 0) for g in poe.execution.resources.get("gpus", [])),
     )
 
-    # Get updated reputation score
-    rep = treasury.get_operator_reputation(operator_ens)
+    # Get updated reputation
+    rep = treasury.get_operator_reputation(poe.operator.operator_ens)
     rep_score = rep["reputation_score"] if rep else 0.0
 
-    return PoESubmitResponse(
-        status="accepted",
-        poe_id=poe_id,
-        job_id=job_id,
-        verified=True,
-        payment=tx.amount,
-        reputation_score=rep_score,
-    )
+    return {
+        "ok": True,
+        "epoch_id": epoch.epoch_id,
+        "poe_id": poe.poe_id,
+        "job_id": poe.job.job_id,
+        "message_hash": h,
+        "verified": True,
+        "payment": tx.amount,
+        "reputation_score": rep_score,
+    }
 
 
 @app.get("/reputation/{operator_ens}")
@@ -580,12 +681,9 @@ def reset_epoch_state() -> TreasuryEpochState:
 @app.post("/epoch/close")
 async def close_epoch():
     """
-    Close current epoch and compute payouts.
+    Close current epoch and compute payouts (unsigned).
 
-    Gathers operator stats and revenue, runs distribution algorithm,
-    applies payouts to operator accounts.
-
-    Returns PayoutReport.
+    Use /treasury/epoch/close for signed reports.
     """
     treasury = get_treasury()
     epoch = get_epoch_state()
@@ -638,6 +736,48 @@ async def close_epoch():
     reset_epoch_state()
 
     return result
+
+
+@app.post("/treasury/epoch/close")
+async def treasury_close_epoch():
+    """
+    Close current epoch and compute signed payout report.
+
+    Requires SWARMVISION_SIGNER_KEY environment variable.
+    Returns signed PayoutReport for auditability.
+    """
+    import time
+
+    treasury = get_treasury()
+    epoch = get_epoch_state()
+
+    if not PROTOCOL_SIGNER_KEY:
+        raise HTTPException(500, "SWARMVISION_SIGNER_KEY not set")
+
+    # Build inputs from epoch state
+    ledger = epoch.to_ledger()
+    operators = epoch.to_operator_stats()
+
+    # Compute payouts
+    cfg = TreasuryConfig()
+    report = compute_epoch_payouts(ledger, operators, cfg)
+
+    # Sign the report
+    signed = sign_payout_report(report, PROTOCOL_SIGNER_KEY)
+
+    # Apply payouts to operator accounts
+    for payout in report.payouts:
+        if payout.payout > D("0"):
+            treasury.deposit(
+                payout.operator_ens,
+                int(payout.payout),
+                reference=f"{epoch.epoch_id}:distribution"
+            )
+
+    # Reset epoch state for next period
+    reset_epoch_state()
+
+    return signed
 
 
 @app.get("/epoch/status")
