@@ -52,22 +52,45 @@ Execution is ephemeral. We process, we prove, we forget.
 
 ### 3. Proof of Execution
 
-Every job produces a cryptographic proof:
-- Who executed it
-- What hardware was used
-- When it ran
-- Hash of the result
+Every job produces a cryptographic proof. No proof, no payout.
 
-Proofs are verifiable. Promises are not.
+**PoE contains:**
+- `operator` — ENS, wallet address, agent build
+- `execution` — timestamps, host, CPU/GPU resources
+- `artifact` — model/pipeline hash
+- `result` — status, output hash
+- `signature` — EIP-191/EIP-712 over canonical JSON
+
+**Signing rule (LOCKED):**
+1. Remove signature block
+2. Canonicalize: UTF-8, sorted keys, no whitespace
+3. `message_hash = sha256(canonical_json)`
+4. Sign with operator wallet
+5. Reattach signature block
+
+See: [`docs/protocol/PoE.signing.md`](../protocol/PoE.signing.md)
+Schema: [`docs/protocol/ProofOfExecution.schema.json`](../protocol/ProofOfExecution.schema.json)
+
+Proofs are verified at ingestion. Invalid proofs are rejected. Valid proofs trigger payout.
 
 ### 4. Pool Economics
 
-Readiness has value.
+Readiness has value. Execution has proof.
 
-- Operators stake availability
-- Clients prepay with credits
-- Fair distribution of work and reward
-- No race to the bottom
+**Payout flow:**
+1. Client submits job → credits reserved
+2. Operator executes → generates PoE
+3. OS validates PoE signature
+4. Valid → operator paid + reputation credited
+5. Invalid → job failed, no payout
+
+**Reputation is derived from PoE:**
+- Jobs completed (validated proofs)
+- Uptime ratio (heartbeat consistency)
+- Hardware capacity (GPU, VRAM)
+- Result quality (success rate)
+
+No proof, no payout, no reputation.
 
 ### 5. Human-Operated Compute
 
@@ -112,22 +135,29 @@ swarmagent register --ens yourname.swarmcompute.eth
 swarmagent start
 ```
 
-## The Future
+## Protocol Status
 
-This is v0.1 — the protocol seed.
+**v0.2 — Identity Lock**
 
-What comes next:
-- Real ENS integration
+Frozen:
+- PoE schema and signing rule
+- ENS namespace separation
+- Treasury pool math
+
+Live:
+- ECDSA signatures (secp256k1)
+- GPU capability detection
+- Uptime-weighted distribution
+- Mesh-first networking
+
+Next:
 - On-chain treasury
+- ENS subdomain registration
 - Proof verification contracts
-- Model routing intelligence
-- Geographic distribution
-- Reputation systems
-
-The swarm grows. The vision scales.
+- Reputation staking
 
 ---
 
 *Built by humans. Run by humans. For humans.*
 
-*SwarmVision Protocol — 2024*
+*SwarmVision Protocol — 2025*

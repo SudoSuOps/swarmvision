@@ -31,6 +31,7 @@ from swarmvision.identity.ens import (
     verify_client,
 )
 from swarmvision.identity.crypto import verify_proof_signature
+from swarmvision.identity.poe import validate_poe, extract_poe_metrics
 from swarmvision.treasury.pool import get_treasury, JOB_COST
 from swarmvision.routing.router import get_router, JobStatus
 
@@ -97,6 +98,7 @@ class JobStatusResponse(BaseModel):
 
 
 class ProofSubmitRequest(BaseModel):
+    """Legacy v0.1 proof format."""
     agent_ens: str
     job_id: str
     hardware: dict
@@ -112,6 +114,17 @@ class ProofSubmitResponse(BaseModel):
     job_id: str
     verified: bool
     payment: Optional[int]
+
+
+class PoESubmitResponse(BaseModel):
+    """v0.2 PoE response."""
+    status: str
+    poe_id: str
+    job_id: str
+    verified: bool
+    payment: Optional[int]
+    reputation_score: Optional[float]
+    error: Optional[str] = None
 
 
 class AccountResponse(BaseModel):
@@ -314,10 +327,9 @@ async def list_jobs(
 @app.post("/proof/submit", response_model=ProofSubmitResponse)
 async def submit_proof(request: ProofSubmitRequest):
     """
-    Submit proof of execution.
+    Submit proof of execution (legacy v0.1 format).
 
-    Agent submits proof after completing a job.
-    Triggers payment if valid.
+    Use /poe/submit for v0.2 format.
     """
     router = get_router()
     treasury = get_treasury()
@@ -382,6 +394,95 @@ async def submit_proof(request: ProofSubmitRequest):
         verified=True,
         payment=tx.amount,
     )
+
+
+@app.post("/poe/submit", response_model=PoESubmitResponse)
+async def submit_poe(poe: dict):
+    """
+    Submit Proof of Execution (v0.2 format).
+
+    Validates PoE according to locked signing rule:
+    1. Remove signature block
+    2. Canonicalize: UTF-8, sorted keys, no whitespace
+    3. message_hash = sha256(canonical_json)
+    4. Verify signature against operator wallet
+
+    No valid proof = no payout.
+    """
+    router = get_router()
+    treasury = get_treasury()
+
+    # Validate PoE
+    result = validate_poe(poe)
+
+    poe_id = poe.get("poe_id", "")
+    job_id = poe.get("job", {}).get("job_id", "")
+    operator_ens = poe.get("operator", {}).get("operator_ens", "")
+
+    if not result.valid:
+        # Record rejected proof (damages reputation)
+        if operator_ens:
+            treasury.record_rejected_poe(operator_ens)
+
+        return PoESubmitResponse(
+            status="rejected",
+            poe_id=poe_id,
+            job_id=job_id,
+            verified=False,
+            payment=None,
+            reputation_score=None,
+            error=result.error,
+        )
+
+    # Extract metrics from validated PoE
+    metrics = extract_poe_metrics(poe)
+
+    # Complete job in router
+    job = router.get_job(job_id)
+    if job:
+        router.complete_job(job_id, poe.get("result", {}).get("result_hash", ""))
+
+    # Process validated PoE - pay operator + update reputation
+    tx = treasury.process_validated_poe(
+        operator_ens=metrics["operator_ens"],
+        job_id=metrics["job_id"],
+        duration_ms=metrics["duration_ms"],
+        result_status=metrics["result_status"],
+        gpu_count=metrics["gpu_count"],
+        vram_bytes=metrics["vram_bytes"],
+    )
+
+    # Get updated reputation score
+    rep = treasury.get_operator_reputation(operator_ens)
+    rep_score = rep["reputation_score"] if rep else 0.0
+
+    return PoESubmitResponse(
+        status="accepted",
+        poe_id=poe_id,
+        job_id=job_id,
+        verified=True,
+        payment=tx.amount,
+        reputation_score=rep_score,
+    )
+
+
+@app.get("/reputation/{operator_ens}")
+async def get_reputation(operator_ens: str):
+    """Get operator reputation derived from validated PoEs."""
+    treasury = get_treasury()
+    rep = treasury.get_operator_reputation(operator_ens)
+
+    if not rep:
+        raise HTTPException(status_code=404, detail="No reputation data")
+
+    return rep
+
+
+@app.get("/reputation")
+async def get_leaderboard(limit: int = Query(default=20, le=100)):
+    """Get reputation leaderboard."""
+    treasury = get_treasury()
+    return {"leaderboard": treasury.get_reputation_leaderboard(limit)}
 
 
 # =============================================================================

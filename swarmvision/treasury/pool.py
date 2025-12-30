@@ -85,7 +85,69 @@ class Account:
     total_spent: int = 0
     jobs_submitted: int = 0
     jobs_completed: int = 0
+    jobs_failed: int = 0
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+@dataclass
+class OperatorReputation:
+    """
+    Operator reputation derived from validated PoEs.
+
+    No proof, no reputation.
+    """
+    ens_name: str
+    # Proof-derived metrics
+    proofs_validated: int = 0
+    proofs_rejected: int = 0
+    total_duration_ms: int = 0
+    total_jobs_success: int = 0
+    total_jobs_failed: int = 0
+    # Hardware capacity (from latest proof)
+    gpu_count: int = 0
+    vram_bytes: int = 0
+    # Computed scores
+    success_rate: float = 1.0
+    avg_duration_ms: float = 0.0
+
+    def record_validated_proof(self, duration_ms: int, status: str, gpu_count: int, vram_bytes: int):
+        """Record a validated proof."""
+        self.proofs_validated += 1
+        self.total_duration_ms += duration_ms
+        self.gpu_count = gpu_count
+        self.vram_bytes = vram_bytes
+
+        if status == "success":
+            self.total_jobs_success += 1
+        else:
+            self.total_jobs_failed += 1
+
+        # Recompute scores
+        total = self.total_jobs_success + self.total_jobs_failed
+        if total > 0:
+            self.success_rate = self.total_jobs_success / total
+        if self.proofs_validated > 0:
+            self.avg_duration_ms = self.total_duration_ms / self.proofs_validated
+
+    def record_rejected_proof(self):
+        """Record a rejected proof."""
+        self.proofs_rejected += 1
+
+    @property
+    def reputation_score(self) -> float:
+        """
+        Compute reputation score.
+
+        Score = success_rate * log2(proofs_validated + 1) * capacity_factor
+        """
+        import math
+        if self.proofs_validated == 0:
+            return 0.0
+
+        proof_factor = math.log2(self.proofs_validated + 1)
+        capacity_factor = math.sqrt(self.vram_bytes / (1024 ** 3) + 1)  # sqrt(GB)
+
+        return self.success_rate * proof_factor * capacity_factor
 
 
 @dataclass
@@ -190,6 +252,9 @@ class TreasuryPool:
         self._readiness_pool = 0  # Accumulated readiness rewards
         self._last_distribution = time.time()
         self._distribution_epoch = 0
+
+        # v0.2: Operator reputation (derived from validated PoEs)
+        self._operator_reputation: dict[str, OperatorReputation] = {}
 
     def _next_tx_id(self) -> str:
         """Generate next transaction ID."""
@@ -300,6 +365,81 @@ class TreasuryPool:
             )
             self._transactions.append(tx)
             return tx
+
+    def process_validated_poe(
+        self,
+        operator_ens: str,
+        job_id: str,
+        duration_ms: int,
+        result_status: str,
+        gpu_count: int,
+        vram_bytes: int
+    ) -> Transaction:
+        """
+        Process a validated Proof of Execution.
+
+        Called after PoE signature verification passes.
+        - Pays operator
+        - Updates reputation
+        - Records metrics
+
+        No valid proof = this method never called = no payout.
+        """
+        with self._lock:
+            # Get or create reputation record
+            if operator_ens not in self._operator_reputation:
+                self._operator_reputation[operator_ens] = OperatorReputation(
+                    ens_name=operator_ens
+                )
+
+            rep = self._operator_reputation[operator_ens]
+            rep.record_validated_proof(duration_ms, result_status, gpu_count, vram_bytes)
+
+            # Update account stats
+            account = self.get_or_create_account(operator_ens)
+            if result_status == "success":
+                account.jobs_completed += 1
+            else:
+                account.jobs_failed += 1
+
+        # Pay operator (uses existing method)
+        return self.pay_operator(operator_ens, job_id)
+
+    def record_rejected_poe(self, operator_ens: str):
+        """Record a rejected PoE. Damages reputation."""
+        with self._lock:
+            if operator_ens not in self._operator_reputation:
+                self._operator_reputation[operator_ens] = OperatorReputation(
+                    ens_name=operator_ens
+                )
+            self._operator_reputation[operator_ens].record_rejected_proof()
+
+    def get_operator_reputation(self, operator_ens: str) -> Optional[dict]:
+        """Get operator reputation stats."""
+        rep = self._operator_reputation.get(operator_ens)
+        if not rep:
+            return None
+
+        return {
+            "ens_name": rep.ens_name,
+            "proofs_validated": rep.proofs_validated,
+            "proofs_rejected": rep.proofs_rejected,
+            "success_rate": round(rep.success_rate, 4),
+            "avg_duration_ms": round(rep.avg_duration_ms, 2),
+            "gpu_count": rep.gpu_count,
+            "vram_gb": round(rep.vram_bytes / (1024 ** 3), 2),
+            "reputation_score": round(rep.reputation_score, 4),
+        }
+
+    def get_reputation_leaderboard(self, limit: int = 20) -> list[dict]:
+        """Get top operators by reputation score."""
+        operators = [
+            self.get_operator_reputation(ens)
+            for ens in self._operator_reputation
+        ]
+        operators = [o for o in operators if o is not None]
+        operators.sort(key=lambda x: x["reputation_score"], reverse=True)
+        return operators[:limit]
 
     def refund_job(self, client_ens: str, job_id: str) -> Transaction:
         """Refund a failed job payment."""
