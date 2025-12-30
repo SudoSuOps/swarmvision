@@ -1,87 +1,325 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://swarmvision.io/protocol/v0.2/ProofOfExecution.schema.json",
-  "title": "ProofOfExecution",
-  "description": "Proof that a specific agent executed a specific job on specific hardware. This schema is FROZEN as of v0.2.",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://swarmvision.eth/schemas/proof-of-execution/v0.2.json",
+  "title": "SwarmVision Proof of Execution",
+  "description": "Cryptographically verifiable proof that a SwarmCompute operator executed a job with a specific artifact, producing a specific result, within a measured runtime window.",
   "type": "object",
+  "additionalProperties": false,
   "required": [
-    "agent_ens",
-    "job_id",
-    "hardware",
-    "model_id",
-    "start_time",
-    "end_time",
-    "result_hash",
+    "protocol",
+    "poe_id",
+    "job",
+    "operator",
+    "execution",
+    "artifact",
+    "result",
+    "attestations",
     "signature"
   ],
   "properties": {
-    "agent_ens": {
-      "type": "string",
-      "description": "ENS name of the operator (*.swarmcompute.eth)",
-      "pattern": "^[a-z0-9-]+\\.swarmcompute\\.eth$"
-    },
-    "job_id": {
-      "type": "string",
-      "description": "Unique job identifier",
-      "pattern": "^job_[a-f0-9]{12}$"
-    },
-    "hardware": {
+    "protocol": {
       "type": "object",
-      "description": "Hardware capabilities at time of execution",
-      "required": ["gpu_count", "vram_total_gb", "cpu_cores", "ram_gb"],
+      "additionalProperties": false,
+      "required": ["name", "version"],
       "properties": {
-        "gpu_count": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Number of GPUs available"
+        "name": { "type": "string", "const": "swarmvision" },
+        "version": { "type": "string", "pattern": "^0\\.(2|[3-9]\\d*)$" }
+      }
+    },
+
+    "poe_id": {
+      "type": "string",
+      "description": "Unique PoE identifier. SHOULD be a ULID or UUIDv7 for time-sortable audit trails.",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$|^[0-9a-fA-F-]{36}$"
+    },
+
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id", "client_ens", "task", "pricing", "received_at"],
+      "properties": {
+        "job_id": {
+          "type": "string",
+          "description": "SwarmVision job identifier.",
+          "minLength": 6,
+          "maxLength": 128
         },
-        "gpu_names": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Names of GPUs (e.g., 'NVIDIA RTX 4090')"
+        "client_ens": {
+          "type": "string",
+          "description": "Client namespace under swarmvision.eth (e.g., xyzmed.swarmvision.eth).",
+          "pattern": "^[a-z0-9-]+\\.swarmvision\\.eth$"
         },
-        "vram_total_gb": {
-          "type": "number",
-          "minimum": 0,
-          "description": "Total VRAM across all GPUs in GB"
+        "task": {
+          "type": "string",
+          "description": "Canonical task name (e.g., wholeBrainSeg, prostate_mri_anatomy, inference.mock).",
+          "minLength": 2,
+          "maxLength": 128
         },
-        "cpu_cores": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Number of CPU cores"
+        "request_hash": {
+          "type": "string",
+          "description": "Hash of the request manifest (NOT raw PHI). sha256 hex of canonical request metadata.",
+          "pattern": "^[0-9a-f]{64}$"
         },
-        "ram_gb": {
-          "type": "number",
-          "minimum": 0,
-          "description": "System RAM in GB"
+        "received_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the operator/agent received the job (RFC3339)."
+        },
+        "pricing": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["currency", "unit_price", "unit"],
+          "properties": {
+            "currency": {
+              "type": "string",
+              "description": "Accounting currency code (e.g., USD, USDC).",
+              "minLength": 2,
+              "maxLength": 16
+            },
+            "unit_price": {
+              "type": "string",
+              "description": "Decimal string for deterministic accounting (avoid float). Example: '0.10'.",
+              "pattern": "^[0-9]+(\\.[0-9]{1,18})?$"
+            },
+            "unit": {
+              "type": "string",
+              "description": "Billing unit (e.g., scan, job, minute).",
+              "minLength": 1,
+              "maxLength": 32
+            }
+          }
         }
       }
     },
-    "model_id": {
-      "type": "string",
-      "description": "Identifier of the model/pipeline executed",
-      "minLength": 1
+
+    "operator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operator_ens", "wallet", "agent"],
+      "properties": {
+        "operator_ens": {
+          "type": "string",
+          "description": "Operator namespace under swarmcompute.eth (e.g., rig42.swarmcompute.eth).",
+          "pattern": "^[a-z0-9-]+\\.swarmcompute\\.eth$"
+        },
+        "wallet": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["chain", "address"],
+          "properties": {
+            "chain": {
+              "type": "string",
+              "description": "Signing address chain context. Typically 'eip155:1' (Ethereum mainnet) or another CAIP-2 chain id.",
+              "minLength": 3,
+              "maxLength": 32
+            },
+            "address": {
+              "type": "string",
+              "description": "EVM address (lowercase hex).",
+              "pattern": "^0x[0-9a-f]{40}$"
+            }
+          }
+        },
+        "agent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version", "build"],
+          "properties": {
+            "name": { "type": "string", "const": "swarmagent" },
+            "version": { "type": "string", "minLength": 1, "maxLength": 32 },
+            "build": {
+              "type": "string",
+              "description": "Build identifier (git sha, docker image digest, or semver+sha).",
+              "minLength": 6,
+              "maxLength": 128
+            }
+          }
+        }
+      }
     },
-    "start_time": {
-      "type": "string",
-      "format": "date-time",
-      "description": "ISO8601 timestamp when execution started"
+
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started_at", "ended_at", "duration_ms", "host", "resources"],
+      "properties": {
+        "started_at": { "type": "string", "format": "date-time" },
+        "ended_at": { "type": "string", "format": "date-time" },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 86400000,
+          "description": "Execution duration in milliseconds (cap 24h)."
+        },
+        "host": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["hostname", "os", "arch"],
+          "properties": {
+            "hostname": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "os": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "arch": { "type": "string", "minLength": 1, "maxLength": 32 },
+            "machine_id_hash": {
+              "type": "string",
+              "description": "Optional stable machine identifier hash (sha256).",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "mesh_ip": {
+              "type": "string",
+              "description": "Optional mesh/private IP (e.g., Tailscale) for audit correlation.",
+              "minLength": 7,
+              "maxLength": 64
+            }
+          }
+        },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu", "memory", "gpus"],
+          "properties": {
+            "cpu": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["model", "cores"],
+              "properties": {
+                "model": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "cores": { "type": "integer", "minimum": 1, "maximum": 4096 }
+              }
+            },
+            "memory": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["ram_bytes"],
+              "properties": {
+                "ram_bytes": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "gpus": {
+              "type": "array",
+              "minItems": 0,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["index", "vendor", "model", "vram_bytes", "driver"],
+                "properties": {
+                  "index": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "GPU index on the host."
+                  },
+                  "vendor": {
+                    "type": "string",
+                    "description": "GPU vendor (e.g., nvidia, amd).",
+                    "minLength": 1,
+                    "maxLength": 32
+                  },
+                  "model": {
+                    "type": "string",
+                    "description": "GPU model identifier (e.g., RTX 5090).",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "vram_bytes": {
+                    "type": "integer",
+                    "description": "Total VRAM in bytes.",
+                    "minimum": 0
+                  },
+                  "driver": {
+                    "type": "string",
+                    "description": "GPU driver version.",
+                    "minLength": 1,
+                    "maxLength": 64
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     },
-    "end_time": {
-      "type": "string",
-      "format": "date-time",
-      "description": "ISO8601 timestamp when execution completed"
+
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "type", "hash"],
+      "properties": {
+        "artifact_id": {
+          "type": "string",
+          "description": "QuantumRails artifact identifier (model or pipeline).",
+          "minLength": 2,
+          "maxLength": 128
+        },
+        "type": {
+          "type": "string",
+          "description": "Artifact type.",
+          "enum": ["model", "pipeline", "bundle"]
+        },
+        "hash": {
+          "type": "string",
+          "description": "sha256 hash of the artifact used.",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
     },
-    "result_hash": {
-      "type": "string",
-      "description": "SHA256 hash of the execution result",
-      "pattern": "^[a-f0-9]{64}$"
+
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "result_hash"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["success", "failure", "partial"]
+        },
+        "result_hash": {
+          "type": "string",
+          "description": "sha256 hash of canonicalized result output (not raw data).",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "metrics": {
+          "type": "object",
+          "description": "Optional task metrics (counts, volumes, scores).",
+          "additionalProperties": {
+            "type": ["string", "number", "integer"]
+          }
+        }
+      }
     },
+
+    "attestations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ephemeral_execution"],
+      "properties": {
+        "ephemeral_execution": {
+          "type": "boolean",
+          "const": true,
+          "description": "Affirms that no job data was persisted to disk."
+        }
+      }
+    },
+
     "signature": {
-      "type": "string",
-      "description": "ECDSA signature over proof hash (secp256k1)",
-      "pattern": "^0x[a-f0-9]{130}$"
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheme", "message_hash", "signature"],
+      "properties": {
+        "scheme": {
+          "type": "string",
+          "description": "Signature scheme identifier.",
+          "enum": ["eip191", "eip712"]
+        },
+        "message_hash": {
+          "type": "string",
+          "description": "sha256 hash of the canonical PoE message payload.",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "signature": {
+          "type": "string",
+          "description": "Hex-encoded signature produced by operator wallet.",
+          "pattern": "^0x[0-9a-fA-F]{130}$"
+        }
+      }
     }
-  },
-  "additionalProperties": false
+  }
 }
