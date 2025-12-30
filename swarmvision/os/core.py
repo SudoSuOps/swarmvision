@@ -412,6 +412,95 @@ async def list_jobs(
 
 
 # =============================================================================
+# JOB RESULT STORAGE
+# =============================================================================
+
+# In-memory result and PoE storage (would be persistent in production)
+_job_results: dict[str, bytes] = {}
+_job_poes: dict[str, dict] = {}
+
+
+class JobResultUpload(BaseModel):
+    job_id: str
+    data: str  # base64 encoded
+    content_type: str = "application/octet-stream"
+
+
+@app.post("/job/{job_id}/result")
+async def upload_job_result(job_id: str, upload: JobResultUpload):
+    """
+    Upload job result artifact.
+
+    Called by SwarmAgent after job execution.
+    """
+    import base64
+
+    router = get_router()
+    job = router.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Decode and store
+    try:
+        result_data = base64.b64decode(upload.data)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 data")
+
+    _job_results[job_id] = result_data
+
+    return {
+        "status": "ok",
+        "job_id": job_id,
+        "size": len(result_data),
+        "content_type": upload.content_type,
+    }
+
+
+@app.get("/job/{job_id}/result")
+async def download_job_result(job_id: str):
+    """
+    Download job result artifact.
+
+    Called by client to retrieve completed job output.
+    """
+    from fastapi.responses import Response
+
+    router = get_router()
+    job = router.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job_id not in _job_results:
+        raise HTTPException(status_code=404, detail="Result not available")
+
+    return Response(
+        content=_job_results[job_id],
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={job_id}.pdf"}
+    )
+
+
+@app.get("/job/{job_id}/poe")
+async def get_job_poe(job_id: str):
+    """
+    Get Proof of Execution for a job.
+
+    Returns the PoE that was submitted for this job.
+    """
+    if job_id not in _job_poes:
+        raise HTTPException(status_code=404, detail="PoE not found for job")
+
+    return _job_poes[job_id]
+
+
+def store_poe(job_id: str, poe: dict):
+    """Store PoE for later retrieval."""
+    _job_poes[job_id] = poe
+
+
+# =============================================================================
 # PROOF ENDPOINTS
 # =============================================================================
 
@@ -584,6 +673,9 @@ async def submit_poe(poe: ProofOfExecution):
     # Get updated reputation
     rep = treasury.get_operator_reputation(poe.operator.operator_ens)
     rep_score = rep["reputation_score"] if rep else 0.0
+
+    # Store PoE for later retrieval by client
+    store_poe(poe.job.job_id, poe.model_dump())
 
     return {
         "ok": True,

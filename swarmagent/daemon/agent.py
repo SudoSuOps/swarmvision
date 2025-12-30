@@ -34,6 +34,14 @@ from swarmagent.proof.execution import (
     create_proof,
 )
 
+# Import task handlers
+try:
+    from swarmview.tasks.mri_demo import execute_mri_demo
+    HAS_MRI_DEMO = True
+except ImportError:
+    HAS_MRI_DEMO = False
+    execute_mri_demo = None
+
 
 # =============================================================================
 # CONFIGURATION
@@ -129,12 +137,18 @@ class JobExecutor:
     - Return actual results
     """
 
-    def __init__(self, agent_ens: str):
+    def __init__(self, agent_ens: str, private_key: str = ""):
         self.agent_ens = agent_ens
+        self.private_key = private_key
         self.handlers: dict[str, Callable] = {}
+        self.result_store: dict[str, bytes] = {}  # job_id -> result bytes
 
         # Register default mock handler
         self.register_handler("*", self._mock_execute)
+
+        # Register SwarmView task handlers
+        if HAS_MRI_DEMO:
+            self.register_handler("swarmview.mri.demo", self._execute_mri_demo)
 
     def register_handler(self, model_id: str, handler: Callable):
         """Register a handler for a specific model."""
@@ -166,6 +180,32 @@ class JobExecutor:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
+    def _execute_mri_demo(self, job: Job) -> bytes:
+        """Execute MRI demo task — generates PDF report."""
+        if not HAS_MRI_DEMO:
+            raise RuntimeError("MRI demo handler not available")
+
+        print(f"[mri-demo] Processing job {job.job_id}")
+
+        # Execute the MRI demo task
+        pdf_bytes, analysis = execute_mri_demo(
+            job_payload=job.payload,
+            operator_ens=self.agent_ens,
+            job_id=job.job_id,
+        )
+
+        # Store result for later retrieval
+        self.result_store[job.job_id] = pdf_bytes
+
+        print(f"[mri-demo] Generated PDF: {len(pdf_bytes)} bytes")
+        print(f"[mri-demo] Risk: {analysis['severity']} ({analysis['risk_score']:.1%})")
+
+        return pdf_bytes
+
+    def get_result(self, job_id: str) -> Optional[bytes]:
+        """Get stored result for a job."""
+        return self.result_store.get(job_id)
+
 
 # =============================================================================
 # AGENT DAEMON
@@ -186,7 +226,7 @@ class SwarmAgent:
     def __init__(self, config: AgentConfig):
         self.config = config
         self.hardware = HardwareSummary.detect()
-        self.executor = JobExecutor(config.ens_name)
+        self.executor = JobExecutor(config.ens_name, config.private_key)
         self.running = False
         self.start_time = datetime.now(timezone.utc)
 
@@ -391,6 +431,133 @@ class SwarmAgent:
 
         return False
 
+    async def upload_result(self, job_id: str, result_data: bytes) -> bool:
+        """Upload job result artifact to coordinator."""
+        import urllib.request
+        import base64
+
+        try:
+            payload = json.dumps({
+                "job_id": job_id,
+                "data": base64.b64encode(result_data).decode(),
+                "content_type": "application/pdf",
+            }).encode()
+
+            req = urllib.request.Request(
+                f"{self.config.coordinator_url}/job/{job_id}/result",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if resp.status == 200:
+                    print(f"[result] Uploaded {len(result_data)} bytes for {job_id}")
+                    return True
+        except Exception as e:
+            print(f"[result] Upload failed: {e}")
+
+        return False
+
+    async def submit_poe_v2(self, job: Job, proof: ProofOfExecution, result_hash: str) -> bool:
+        """Submit v0.2 Proof of Execution."""
+        import urllib.request
+        import hashlib
+
+        # Import signing utils
+        try:
+            from swarmvision.identity.signing import canonical_json_bytes, sha256_hex
+            from swarmvision.identity.ethsig import sign_eip191_hash
+            from swarmvision.identity.crypto import private_key_to_address
+            HAS_SIGNING = True
+        except ImportError:
+            HAS_SIGNING = False
+
+        if not HAS_SIGNING or not self.config.private_key:
+            print("[poe] v0.2 signing not available, using legacy format")
+            return await self.submit_proof(proof)
+
+        # Get wallet address from private key
+        wallet_address = private_key_to_address(self.config.private_key)
+
+        # Build v0.2 PoE structure
+        poe_id = f"poe_{uuid.uuid4().hex[:12]}"
+
+        poe_dict = {
+            "protocol": {"name": "swarmvision", "version": "0.2"},
+            "poe_id": poe_id,
+            "job": {
+                "job_id": job.job_id,
+                "client_ens": job.client_ens,
+                "task": job.model_id,
+                "received_at": job.submitted_at,
+                "pricing": {"currency": "USD", "unit_price": "10.00", "unit": "job"},
+            },
+            "operator": {
+                "operator_ens": self.config.ens_name,
+                "wallet": {"chain": "ethereum", "address": wallet_address},
+                "agent": {"version": "0.2.0"},
+            },
+            "execution": {
+                "started_at": proof.start_time,
+                "ended_at": proof.end_time,
+                "duration_ms": int((
+                    datetime.fromisoformat(proof.end_time.replace("Z", "+00:00")) -
+                    datetime.fromisoformat(proof.start_time.replace("Z", "+00:00"))
+                ).total_seconds() * 1000),
+                "host": {"hostname": os.uname().nodename},
+                "resources": {
+                    "gpus": [
+                        {"index": i, "name": name, "vram_bytes": int(proof.hardware.vram_total_gb * 1e9 / max(1, proof.hardware.gpu_count))}
+                        for i, name in enumerate(proof.hardware.gpu_names)
+                    ] if proof.hardware.gpu_names else []
+                },
+            },
+            "artifact": {
+                "artifact_id": f"art_{job.job_id}",
+                "type": "pdf",
+                "hash": result_hash,
+            },
+            "result": {
+                "status": "success",
+                "result_hash": result_hash,
+            },
+            "attestations": {},
+        }
+
+        # Sign the PoE
+        b = canonical_json_bytes(poe_dict)
+        h = sha256_hex(b)
+        sig = sign_eip191_hash(h, self.config.private_key)
+
+        poe_dict["signature"] = {
+            "scheme": "eip191",
+            "message_hash": h,
+            "signature": sig,
+        }
+
+        # Submit to coordinator
+        try:
+            payload = json.dumps(poe_dict).encode()
+            req = urllib.request.Request(
+                f"{self.config.coordinator_url}/poe/submit",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if resp.status == 200:
+                    result = json.loads(resp.read())
+                    print(f"[poe] v0.2 submitted: {poe_id}")
+                    print(f"[poe] Verified: {result.get('verified', False)}, Payment: {result.get('payment', 0)}")
+                    self.proofs_submitted += 1
+                    return True
+        except Exception as e:
+            print(f"[poe] v0.2 submit failed: {e}")
+            # Fallback to legacy
+            return await self.submit_proof(proof)
+
+        return False
+
     async def run(self):
         """Main daemon loop."""
         self.running = True
@@ -421,13 +588,27 @@ class SwarmAgent:
 
     async def _job_loop(self):
         """Job polling and execution loop."""
+        import hashlib
+
         while self.running:
             job = await self.poll_jobs()
             if job:
                 print(f"[job] Received: {job.job_id} ({job.model_id})")
                 proof = self.executor.execute(job)
                 print(f"[job] Completed: {job.job_id}")
-                await self.submit_proof(proof)
+
+                # Get result data if available
+                result_data = self.executor.get_result(job.job_id)
+                if result_data:
+                    result_hash = hashlib.sha256(result_data).hexdigest()
+                    # Upload result artifact
+                    await self.upload_result(job.job_id, result_data)
+                    # Submit v0.2 PoE
+                    await self.submit_poe_v2(job, proof, result_hash)
+                else:
+                    # Legacy proof submission
+                    await self.submit_proof(proof)
+
                 self.jobs_completed += 1
             await asyncio.sleep(self.config.job_poll_interval)
 

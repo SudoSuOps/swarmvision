@@ -1,0 +1,7 @@
+{
+  "patient_id": "DEMO-001",
+  "scan_type": "Brain MRI T1-weighted",
+  "scan_date": "2025-12-30",
+  "facility": "SwarmVision Demo Clinic",
+  "notes": "Routine screening scan for demonstration purposes"
+}
