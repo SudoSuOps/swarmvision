@@ -1,404 +1,166 @@
 """
 SwarmVision Protocol — Treasury Pool Distribution
 
-Implements Treasury.distribution.md spec (v0.2 FINAL).
-
-Distributes treasury revenue to *.swarmcompute.eth operators fairly:
-- Executed work (jobs)
-- Readiness (always-on availability)
-- Reliability (valid PoE, low failure)
-
-No PoE = no pay. Suspended/inactive = excluded.
-
-All calculations use Decimal for determinism.
+Reference implementation for TREASURY_POOL_DISTRIBUTION.md spec.
+Deterministic, auditable payout calculation.
 """
 
-from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_DOWN
-from typing import Optional
-import json
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import Decimal, getcontext, ROUND_DOWN
+from typing import List, Optional
+
+getcontext().prec = 50  # deterministic math
 
 
-# =============================================================================
-# CONSTANTS
-# =============================================================================
-
-# Epoch duration in seconds (default: 24 hours)
-EPOCH_SECONDS = 86400
-
-# Minimum uptime to qualify (default: 6 hours)
-MIN_UPTIME_SECONDS = 21600
-
-# Pool split ratios
-WORK_POOL_RATIO = Decimal("0.70")
-READINESS_POOL_RATIO = Decimal("0.30")
-
-# Readiness score weights
-READY_WEIGHT = Decimal("0.7")
-UPTIME_WEIGHT = Decimal("0.3")
-
-# Dust threshold (amounts below this roll to next epoch)
-DUST_THRESHOLD = Decimal("0.000001")
-
-# Precision for all calculations
-PRECISION = Decimal("0.000000000000000001")  # 18 decimals
+def D(x) -> Decimal:
+    return x if isinstance(x, Decimal) else Decimal(str(x))
 
 
-# =============================================================================
-# DATA STRUCTURES
-# =============================================================================
+def clamp(x: Decimal, lo: Decimal, hi: Decimal) -> Decimal:
+    return max(lo, min(hi, x))
 
-@dataclass
-class JobRecord:
-    """A single job from the revenue ledger."""
-    job_id: str
-    client_ens: str
-    unit_price: Decimal
+
+@dataclass(frozen=True)
+class TreasuryConfig:
+    epoch_seconds: int = 86400
+    min_uptime_seconds: int = 21600
+    work_pool_pct: Decimal = Decimal("0.70")
+    readiness_pool_pct: Decimal = Decimal("0.30")
+    protocol_fee_pct: Decimal = Decimal("0.00")
+    payout_quant: Decimal = Decimal("0.00000001")
+    dust_threshold: Decimal = Decimal("0.0001")
+    max_share_per_operator: Optional[Decimal] = None
+
+
+@dataclass(frozen=True)
+class OperatorStats:
     operator_ens: str
-    poe_id: str
-    timestamp: str
+    status: str
+    uptime_seconds: int
+    ready_seconds: int
+    jobs_success: int
+    jobs_failure: int
+    poe_invalid: int = 0
 
 
-@dataclass
-class OperatorTelemetry:
-    """Telemetry data for one operator during an epoch."""
-    operator_ens: str
-    uptime_seconds: int = 0
-    ready_seconds: int = 0
-    jobs_success: int = 0
-    jobs_failure: int = 0
-    poe_invalid_count: int = 0
-    status: str = "active"  # From ENS text record
-
-
-@dataclass
-class EpochInput:
-    """All inputs for one epoch's distribution."""
-    epoch_id: str
-    epoch_start: str
-    epoch_end: str
+@dataclass(frozen=True)
+class EpochLedger:
     gross_revenue: Decimal
-    protocol_fees: Decimal
-    refunds: Decimal
-    jobs: list[JobRecord] = field(default_factory=list)
-    telemetry: dict[str, OperatorTelemetry] = field(default_factory=dict)
+    refunds: Decimal = Decimal("0")
 
 
-@dataclass
-class OperatorPayout:
-    """Computed payout for one operator."""
+@dataclass(frozen=True)
+class PayoutLine:
     operator_ens: str
-    work_payout: Decimal
-    readiness_payout: Decimal
-    gross_payout: Decimal
+    eligible: bool
     work_score: Decimal
     readiness_score: Decimal
     penalty: Decimal
-    eligible: bool
-    reason: str = ""
+    payout: Decimal
 
 
-@dataclass
-class EpochResult:
-    """Result of distribution calculation."""
-    epoch_id: str
+@dataclass(frozen=True)
+class PayoutReport:
+    epoch_seconds: int
+    gross_revenue: Decimal
+    protocol_fee: Decimal
+    refunds: Decimal
     net_pool: Decimal
     work_pool: Decimal
     readiness_pool: Decimal
-    payouts: list[OperatorPayout]
-    dust_carryover: Decimal
-    total_distributed: Decimal
+    payouts: List[PayoutLine]
+    dust_rolled: Decimal
 
 
-# =============================================================================
-# HELPER FUNCTIONS
-# =============================================================================
-
-def clamp(value: Decimal, min_val: Decimal, max_val: Decimal) -> Decimal:
-    """Clamp a value to a range."""
-    return max(min_val, min(max_val, value))
+def _q(x: Decimal, q: Decimal) -> Decimal:
+    return x.quantize(q, rounding=ROUND_DOWN)
 
 
-def to_decimal(value) -> Decimal:
-    """Convert any value to Decimal."""
-    if isinstance(value, Decimal):
-        return value
-    if isinstance(value, (int, float)):
-        return Decimal(str(value))
-    if isinstance(value, str):
-        return Decimal(value)
-    raise ValueError(f"Cannot convert {type(value)} to Decimal")
+def compute_epoch_payouts(
+    ledger: EpochLedger,
+    operators: List[OperatorStats],
+    cfg: TreasuryConfig = TreasuryConfig(),
+) -> PayoutReport:
 
+    gross = ledger.gross_revenue
+    refunds = ledger.refunds
 
-# =============================================================================
-# ELIGIBILITY
-# =============================================================================
+    protocol_fee = _q(gross * cfg.protocol_fee_pct, cfg.payout_quant)
+    net_pool = max(Decimal("0"), gross - refunds - protocol_fee)
 
-def check_eligibility(
-    operator_ens: str,
-    telemetry: OperatorTelemetry,
-    min_uptime: int = MIN_UPTIME_SECONDS
-) -> tuple[bool, str]:
-    """
-    Check if operator is eligible for distribution.
+    work_pool = _q(net_pool * cfg.work_pool_pct, cfg.payout_quant)
+    readiness_pool = _q(net_pool * cfg.readiness_pool_pct, cfg.payout_quant)
 
-    From spec section 4:
-    - ENS resolves and status=active at payout time
-    - uptime_seconds >= MIN_UPTIME_SECONDS (default: 6 hours)
-    - Has no severe violations
+    remainder = net_pool - (work_pool + readiness_pool)
+    work_pool += remainder  # deterministic sink
 
-    Returns (eligible, reason).
-    """
-    # Check status
-    if telemetry.status != "active":
-        return False, f"status={telemetry.status}"
+    epoch = Decimal(cfg.epoch_seconds)
 
-    # Check uptime
-    if telemetry.uptime_seconds < min_uptime:
-        return False, f"uptime={telemetry.uptime_seconds}s < {min_uptime}s"
+    scored = []
 
-    # Check for invalid PoEs (severe violation)
-    if telemetry.poe_invalid_count > 0:
-        return False, f"poe_invalid_count={telemetry.poe_invalid_count}"
-
-    return True, "eligible"
-
-
-# =============================================================================
-# SCORING
-# =============================================================================
-
-def compute_work_score(telemetry: OperatorTelemetry) -> Decimal:
-    """
-    Compute work score.
-
-    From spec section 6.1:
-    work_score = jobs_success
-    """
-    return Decimal(telemetry.jobs_success)
-
-
-def compute_readiness_score(
-    telemetry: OperatorTelemetry,
-    epoch_seconds: int = EPOCH_SECONDS
-) -> Decimal:
-    """
-    Compute readiness score.
-
-    From spec section 6.2:
-    readiness_ratio = clamp(ready_seconds / epoch_seconds, 0..1)
-    uptime_ratio = clamp(uptime_seconds / epoch_seconds, 0..1)
-    readiness_score = 0.7 * readiness_ratio + 0.3 * uptime_ratio
-    """
-    epoch_dec = Decimal(epoch_seconds)
-
-    readiness_ratio = clamp(
-        Decimal(telemetry.ready_seconds) / epoch_dec,
-        Decimal("0"),
-        Decimal("1")
-    )
-
-    uptime_ratio = clamp(
-        Decimal(telemetry.uptime_seconds) / epoch_dec,
-        Decimal("0"),
-        Decimal("1")
-    )
-
-    return READY_WEIGHT * readiness_ratio + UPTIME_WEIGHT * uptime_ratio
-
-
-def compute_reliability_penalty(telemetry: OperatorTelemetry) -> Decimal:
-    """
-    Compute reliability penalty.
-
-    From spec section 6.3:
-    failure_rate = jobs_failure / max(1, jobs_success + jobs_failure)
-    penalty = clamp(1 - failure_rate, 0..1)
-    """
-    total_jobs = telemetry.jobs_success + telemetry.jobs_failure
-    if total_jobs == 0:
-        return Decimal("1")  # No jobs = no penalty
-
-    failure_rate = Decimal(telemetry.jobs_failure) / Decimal(max(1, total_jobs))
-
-    return clamp(
-        Decimal("1") - failure_rate,
-        Decimal("0"),
-        Decimal("1")
-    )
-
-
-# =============================================================================
-# DISTRIBUTION ALGORITHM
-# =============================================================================
-
-def calculate_distribution(
-    epoch_input: EpochInput,
-    dust_from_previous: Decimal = Decimal("0")
-) -> EpochResult:
-    """
-    Calculate distribution for one epoch.
-
-    From spec section 7:
-    1. Compute net_pool = gross - protocol_fees - refunds
-    2. Split into work_pool (70%) and readiness_pool (30%)
-    3. Score each eligible operator
-    4. Distribute proportionally
-    5. Handle dust carryover
-
-    All calculations use Decimal for determinism.
-    """
-    # Step 1: Compute net pool
-    net_pool = (
-        epoch_input.gross_revenue
-        - epoch_input.protocol_fees
-        - epoch_input.refunds
-        + dust_from_previous
-    )
-
-    if net_pool <= Decimal("0"):
-        return EpochResult(
-            epoch_id=epoch_input.epoch_id,
-            net_pool=net_pool,
-            work_pool=Decimal("0"),
-            readiness_pool=Decimal("0"),
-            payouts=[],
-            dust_carryover=Decimal("0"),
-            total_distributed=Decimal("0"),
+    for op in operators:
+        eligible = (
+            op.status == "active"
+            and op.uptime_seconds >= cfg.min_uptime_seconds
+            and op.poe_invalid == 0
         )
 
-    # Step 2: Split pools
-    work_pool = net_pool * WORK_POOL_RATIO
-    readiness_pool = net_pool * READINESS_POOL_RATIO
+        work_score = Decimal(op.jobs_success) if eligible else Decimal("0")
 
-    # Step 3: Score operators
-    payouts: list[OperatorPayout] = []
-    total_work_score = Decimal("0")
-    total_ready_score = Decimal("0")
+        uptime_ratio = clamp(Decimal(op.uptime_seconds) / epoch, Decimal("0"), Decimal("1"))
+        ready_ratio = clamp(Decimal(op.ready_seconds) / epoch, Decimal("0"), Decimal("1"))
+        readiness_score = (
+            Decimal("0.7") * ready_ratio + Decimal("0.3") * uptime_ratio
+        ) if eligible else Decimal("0")
 
-    for operator_ens, telemetry in epoch_input.telemetry.items():
-        # Check eligibility
-        eligible, reason = check_eligibility(operator_ens, telemetry)
+        denom = op.jobs_success + op.jobs_failure
+        failure_rate = Decimal(op.jobs_failure) / Decimal(denom) if denom > 0 else Decimal("0")
+        penalty = clamp(Decimal("1") - failure_rate, Decimal("0"), Decimal("1")) if eligible else Decimal("0")
 
-        if not eligible:
-            payouts.append(OperatorPayout(
-                operator_ens=operator_ens,
-                work_payout=Decimal("0"),
-                readiness_payout=Decimal("0"),
-                gross_payout=Decimal("0"),
-                work_score=Decimal("0"),
-                readiness_score=Decimal("0"),
-                penalty=Decimal("0"),
-                eligible=False,
-                reason=reason,
-            ))
-            continue
+        scored.append((op, eligible, work_score, readiness_score, penalty))
 
-        # Compute scores
-        work_score = compute_work_score(telemetry)
-        readiness_score = compute_readiness_score(telemetry)
-        penalty = compute_reliability_penalty(telemetry)
+    total_work = sum(ws * p for _, _, ws, _, p in scored)
+    total_ready = sum(rs * p for _, _, _, rs, p in scored)
 
-        final_work_score = work_score * penalty
-        final_ready_score = readiness_score * penalty
+    payouts: List[PayoutLine] = []
+    allocated = Decimal("0")
 
-        total_work_score += final_work_score
-        total_ready_score += final_ready_score
+    for op, eligible, ws, rs, p in scored:
+        fw = ws * p
+        fr = rs * p
 
-        payouts.append(OperatorPayout(
-            operator_ens=operator_ens,
-            work_payout=Decimal("0"),  # Filled in step 4
-            readiness_payout=Decimal("0"),
-            gross_payout=Decimal("0"),
-            work_score=final_work_score,
-            readiness_score=final_ready_score,
-            penalty=penalty,
-            eligible=True,
+        wp = work_pool * (fw / total_work) if eligible and total_work > 0 else Decimal("0")
+        rp = readiness_pool * (fr / total_ready) if eligible and total_ready > 0 else Decimal("0")
+
+        payout = _q(wp + rp, cfg.payout_quant)
+
+        if cfg.max_share_per_operator and net_pool > 0:
+            cap = _q(net_pool * cfg.max_share_per_operator, cfg.payout_quant)
+            payout = min(payout, cap)
+
+        payouts.append(PayoutLine(
+            operator_ens=op.operator_ens,
+            eligible=eligible,
+            work_score=_q(fw, cfg.payout_quant),
+            readiness_score=_q(fr, cfg.payout_quant),
+            penalty=_q(p, cfg.payout_quant),
+            payout=payout,
         ))
 
-    # Step 4: Calculate payouts
-    total_distributed = Decimal("0")
+        allocated += payout
 
-    for payout in payouts:
-        if not payout.eligible:
-            continue
+    dust = _q(net_pool - allocated, cfg.payout_quant)
 
-        # Work payout
-        if total_work_score > Decimal("0"):
-            payout.work_payout = (
-                work_pool * payout.work_score / total_work_score
-            ).quantize(PRECISION, rounding=ROUND_DOWN)
-        else:
-            payout.work_payout = Decimal("0")
-
-        # Readiness payout
-        if total_ready_score > Decimal("0"):
-            payout.readiness_payout = (
-                readiness_pool * payout.readiness_score / total_ready_score
-            ).quantize(PRECISION, rounding=ROUND_DOWN)
-        else:
-            payout.readiness_payout = Decimal("0")
-
-        payout.gross_payout = payout.work_payout + payout.readiness_payout
-        total_distributed += payout.gross_payout
-
-    # Step 5: Calculate dust carryover
-    dust_carryover = net_pool - total_distributed
-
-    # Filter out dust payouts
-    for payout in payouts:
-        if payout.gross_payout < DUST_THRESHOLD:
-            dust_carryover += payout.gross_payout
-            payout.work_payout = Decimal("0")
-            payout.readiness_payout = Decimal("0")
-            payout.gross_payout = Decimal("0")
-
-    return EpochResult(
-        epoch_id=epoch_input.epoch_id,
-        net_pool=net_pool,
-        work_pool=work_pool,
-        readiness_pool=readiness_pool,
-        payouts=payouts,
-        dust_carryover=dust_carryover,
-        total_distributed=total_distributed,
-    )
-
-
-# =============================================================================
-# SERIALIZATION (for determinism verification)
-# =============================================================================
-
-def result_to_dict(result: EpochResult) -> dict:
-    """Convert result to JSON-serializable dict."""
-    return {
-        "epoch_id": result.epoch_id,
-        "net_pool": str(result.net_pool),
-        "work_pool": str(result.work_pool),
-        "readiness_pool": str(result.readiness_pool),
-        "dust_carryover": str(result.dust_carryover),
-        "total_distributed": str(result.total_distributed),
-        "payouts": [
-            {
-                "operator_ens": p.operator_ens,
-                "work_payout": str(p.work_payout),
-                "readiness_payout": str(p.readiness_payout),
-                "gross_payout": str(p.gross_payout),
-                "work_score": str(p.work_score),
-                "readiness_score": str(p.readiness_score),
-                "penalty": str(p.penalty),
-                "eligible": p.eligible,
-                "reason": p.reason,
-            }
-            for p in result.payouts
-        ],
-    }
-
-
-def result_to_json(result: EpochResult) -> str:
-    """Convert result to canonical JSON (for determinism checks)."""
-    return json.dumps(
-        result_to_dict(result),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
+    return PayoutReport(
+        epoch_seconds=cfg.epoch_seconds,
+        gross_revenue=_q(gross, cfg.payout_quant),
+        protocol_fee=protocol_fee,
+        refunds=_q(refunds, cfg.payout_quant),
+        net_pool=_q(net_pool, cfg.payout_quant),
+        work_pool=_q(work_pool, cfg.payout_quant),
+        readiness_pool=_q(readiness_pool, cfg.payout_quant),
+        payouts=sorted(payouts, key=lambda p: p.operator_ens),
+        dust_rolled=max(dust, Decimal("0")),
     )
