@@ -1,133 +1,57 @@
-# Swarm Treasury Pool Distribution Spec
+# Swarm Treasury Pool Distribution Specification
+SwarmVision Protocol v0.2
 
-> **Protocol Version:** v0.2
-> **Status:** FINAL
+## Purpose
+Define a deterministic, auditable mechanism to distribute Swarm Treasury revenue
+to Microscalers (`*.swarmcompute.eth`) based on execution, readiness, and reliability.
 
-## 1. Goal
+This specification is implementation-independent but includes a reference
+implementation in `swarmvision/treasury/distribution.py`.
 
-Distribute treasury revenue to `*.swarmcompute.eth` operators fairly, rewarding:
+## Epoch
+- Fixed accounting window (default: 24h UTC)
+- All calculations are epoch-scoped
+- Same inputs MUST produce identical outputs
 
-- **Executed work** (jobs)
-- **Readiness** (always-on availability)
-- **Reliability** (valid PoE, low failure)
+## Revenue Definitions
+- Gross Revenue: Sum of client job charges
+- Refunds: Client refunds in epoch
+- Protocol Fee: Optional percentage
+- Net Pool = Gross − Refunds − Protocol Fee
 
-And enforce:
-- No PoE = no pay
-- Suspended/inactive = excluded immediately
+## Pool Split
+- Work Pool: 70%
+- Readiness Pool: 30%
 
-## 2. Terms
-
-| Term | Definition |
-|------|------------|
-| **Epoch** | Fixed payout period (default: 24h UTC) |
-| **Gross Revenue** | Total client charges captured during epoch |
-| **Protocol Fees** | Optional fixed percentage for ops/dev (can be 0) |
-| **Net Pool** | `gross - protocol_fees - refunds` |
-| **Eligible Operator** | `role=operator`, `status=active` during epoch, meets minimum heartbeat |
-
-## 3. Inputs (per epoch)
-
-### 3.1 Revenue Ledger
-
-For each job:
-- `job_id`
-- `client_ens`
-- `unit_price` (decimal string)
-- `operator_ens` (who executed)
-- `poe_id` (must be valid)
-- `timestamp`
-
-### 3.2 Operator Telemetry
-
-Per operator:
-- `uptime_seconds` within epoch (from heartbeats)
-- `ready_seconds` within epoch (declared "ready")
-- `jobs_success` (valid PoE + success)
-- `jobs_failure` (valid PoE + failure/partial)
-- `poe_invalid_count` (should be 0)
-
-## 4. Eligibility Rules
-
+## Eligibility
 An operator is eligible if:
-- ENS resolves and `status=active` at payout time
-- `uptime_seconds >= MIN_UPTIME_SECONDS` (default: 6 hours)
-- Has no severe violations
+- ENS role = operator
+- ENS status = active
+- Uptime ≥ minimum threshold
+- No invalid Proofs of Execution
 
-Jobs count only if:
-- PoE validates
-- Operator matches PoE identity
-- Job was billed
+## Scoring
+Work Score:
+- jobs_success
 
-## 5. Pool Split
+Readiness Score:
+- 70% readiness ratio
+- 30% uptime ratio
 
-Net Pool is split into:
+Reliability Penalty:
+- 1 − failure_rate
 
-| Pool | Default |
-|------|---------|
-| Work Pool | 70% |
-| Readiness Pool | 30% |
+## Payout
+Final payout is proportional to:
+- work_score × penalty
+- readiness_score × penalty
 
-## 6. Scoring
+All payouts use fixed-precision decimals.
+Rounding is deterministic and downward only.
 
-### 6.1 Work Score
+## Dust
+Amounts below threshold may roll into the next epoch.
 
-```
-work_units_i = jobs_success_i
-work_score_i = work_units_i
-```
-
-### 6.2 Readiness Score
-
-```
-readiness_ratio_i = clamp(ready_seconds_i / epoch_seconds, 0..1)
-uptime_ratio_i = clamp(uptime_seconds_i / epoch_seconds, 0..1)
-readiness_score_i = (0.7 * readiness_ratio_i + 0.3 * uptime_ratio_i)
-```
-
-### 6.3 Reliability Penalty
-
-```
-failure_rate_i = jobs_failure_i / max(1, jobs_success_i + jobs_failure_i)
-penalty_i = clamp(1 - failure_rate_i, 0.0..1.0)
-```
-
-Final scores:
-```
-final_work_score_i = work_score_i * penalty_i
-final_ready_score_i = readiness_score_i * penalty_i
-```
-
-## 7. Payout Calculation
-
-Let:
-```
-W = sum(final_work_score)
-R = sum(final_ready_score)
-```
-
-Then:
-```
-work_payout_i = work_pool * (final_work_score_i / W) if W>0 else 0
-ready_payout_i = readiness_pool * (final_ready_score_i / R) if R>0 else 0
-gross_payout_i = work_payout_i + ready_payout_i
-```
-
-## 8. Caps & Dust
-
-- **Optional cap:** `MAX_SHARE_PER_OPERATOR` (default: no cap)
-- **Dust:** Amounts below `DUST_THRESHOLD` roll into next epoch
-
-## 9. Determinism Requirements
-
-- All currency amounts are Decimal strings
-- All calculations use fixed precision (18 decimals)
-- Final payouts rounded down
-- Same inputs must produce identical outputs across machines
-
-## 10. Reference Implementation
-
-See: `swarmvision/treasury/distribution.py`
-
----
-
-*This spec is FINAL for SwarmVision Protocol v0.2.*
+## Reference Implementation
+See:
+`swarmvision/treasury/distribution.py`
