@@ -231,14 +231,25 @@ async def agent_heartbeat(request: HeartbeatRequest):
     """
     router = get_router()
     treasury = get_treasury()
+    epoch = get_epoch_state()
 
     # Register/update agent
     agent = router.register_agent(request.agent_ens, request.hardware)
 
-    # v0.2: Record heartbeat for uptime tracking
+    # v0.2: Record heartbeat for uptime tracking (legacy treasury pool)
     vram_gb = request.hardware.get("vram_total_gb", 0)
     gpu_count = request.hardware.get("gpu_count", 0)
     treasury.record_operator_heartbeat(request.agent_ens, vram_gb, gpu_count)
+
+    # v0.2: Record heartbeat to epoch state (new distribution system)
+    # Standard heartbeat interval is 30 seconds
+    HEARTBEAT_INTERVAL = 30
+    epoch.record_heartbeat(
+        operator_ens=request.agent_ens,
+        uptime_delta=HEARTBEAT_INTERVAL,
+        ready_delta=HEARTBEAT_INTERVAL,
+        status="active",
+    )
 
     return HeartbeatResponse(
         status="ok",
@@ -549,6 +560,16 @@ async def submit_poe(poe: ProofOfExecution):
 
     success = (poe.result.status == "success")
     epoch.record_poe(poe.operator.operator_ens, success=success, poe_valid=True)
+
+    # 6b) Grant uptime credit for valid PoE (execution duration as uptime)
+    # This ensures operators accumulate uptime from work, not just heartbeats
+    uptime_seconds = max(1, poe.execution.duration_ms // 1000)
+    epoch.record_heartbeat(
+        operator_ens=poe.operator.operator_ens,
+        uptime_delta=uptime_seconds,
+        ready_delta=uptime_seconds,
+        status="active",
+    )
 
     # 7) Process validated PoE in treasury
     tx = treasury.process_validated_poe(
